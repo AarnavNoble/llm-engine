@@ -15,6 +15,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(cmake/deps.cmake)
 
 find_package(Threads REQUIRED)
+if(APPLE)
+  set(BLA_VENDOR Apple)
+endif()
+find_package(BLAS)
 
 # ---- core library: everything that does not need a GPU ----
 add_library(engine_core
@@ -23,11 +27,22 @@ add_library(engine_core
   src/tokenizer/tokenizer.cpp
   src/kv_cache/block_allocator.cpp
   src/scheduler/scheduler.cpp
+  src/model/cpu/cpu_model.cpp
   src/model/sampler.cpp
 )
 target_include_directories(engine_core PUBLIC include)
 target_link_libraries(engine_core PUBLIC nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
 target_compile_options(engine_core PRIVATE -Wall -Wextra -Wpedantic)
+if(BLAS_FOUND)
+  message(STATUS "CPU GEMMs via BLAS: ${BLAS_LIBRARIES}")
+  target_link_libraries(engine_core PUBLIC ${BLAS_LIBRARIES})
+  target_compile_definitions(engine_core PRIVATE ENGINE_HAVE_CBLAS=1)
+  if(APPLE)
+    target_compile_definitions(engine_core PRIVATE ACCELERATE_NEW_LAPACK=1)
+  endif()
+else()
+  message(STATUS "No BLAS found; CPU GEMMs use naive loops (slow, still correct)")
+endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(engine_core PUBLIC -O3)
 endif()
