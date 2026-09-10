@@ -17,9 +17,15 @@ include(cmake/deps.cmake)
 find_package(Threads REQUIRED)
 
 # ---- core library: everything that does not need a GPU ----
-add_library(engine_core INTERFACE)
-target_include_directories(engine_core INTERFACE include)
-target_link_libraries(engine_core INTERFACE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+add_library(engine_core
+  src/config/config.cpp
+)
+target_include_directories(engine_core PUBLIC include)
+target_link_libraries(engine_core PUBLIC nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+target_compile_options(engine_core PRIVATE -Wall -Wextra -Wpedantic)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  target_compile_options(engine_core PUBLIC -O3)
+endif()
 
 if(ENGINE_CUDA)
   enable_language(CUDA)
