@@ -29,6 +29,7 @@ add_library(engine_core
   src/scheduler/scheduler.cpp
   src/model/cpu/cpu_model.cpp
   src/model/sampler.cpp
+  src/api/server.cpp
   src/api/metrics.cpp
   src/api/engine.cpp
 )
