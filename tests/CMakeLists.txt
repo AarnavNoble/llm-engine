@@ -4,6 +4,7 @@ add_executable(engine_tests
   test_smoke.cpp
   test_config.cpp
   test_safetensors.cpp
+  test_tokenizer.cpp
   test_tensor.cpp
 )
 target_link_libraries(engine_tests PRIVATE engine_core Catch2::Catch2WithMain)
