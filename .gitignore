@@ -1,0 +1,10 @@
+build/
+build-*/
+models/
+tests/data/ref/
+bench/results/*.raw
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.cache/
