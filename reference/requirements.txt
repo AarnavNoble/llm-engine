@@ -1,0 +1,7 @@
+torch>=2.3
+transformers>=4.45
+tokenizers>=0.20
+numpy
+huggingface_hub
+aiohttp
+openai
