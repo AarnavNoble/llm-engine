@@ -6,6 +6,7 @@ add_executable(engine_tests
   test_safetensors.cpp
   test_tokenizer.cpp
   test_tensor.cpp
+  test_block_allocator.cpp
 )
 target_link_libraries(engine_tests PRIVATE engine_core Catch2::Catch2WithMain)
 target_compile_definitions(engine_tests PRIVATE

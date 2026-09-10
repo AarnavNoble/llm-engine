@@ -21,6 +21,7 @@ add_library(engine_core
   src/config/config.cpp
   src/safetensors/safetensors.cpp
   src/tokenizer/tokenizer.cpp
+  src/kv_cache/block_allocator.cpp
 )
 target_include_directories(engine_core PUBLIC include)
 target_link_libraries(engine_core PUBLIC nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
