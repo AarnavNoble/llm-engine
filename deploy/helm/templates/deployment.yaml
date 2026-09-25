@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engine.fullname" . }}
+  labels: {{- include "engine.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.keda.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "engine.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A pod holds a GPU, so never let a new pod wait on a GPU the old one
+      # still owns: surge is only safe when spare GPUs exist.
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels: {{- include "engine.selectorLabels" . | nindent 8 }}
+      {{- if .Values.metrics.annotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.service.port | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.gpu.enabled .Values.tolerations }}
+      tolerations:
+        {{- if .Values.gpu.enabled }}
+        - key: {{ .Values.gpu.resourceName }}
+          operator: Exists
+          effect: NoSchedule
+        {{- end }}
+        {{- with .Values.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: ENGINE_MODEL
+              value: {{ .Values.modelPath | quote }}
+          args:
+            - serve
+            - --model
+            - {{ .Values.modelPath | quote }}
+            - --backend
+            - {{ .Values.backend | quote }}
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.service.port | quote }}
+            - --mode
+            - {{ .Values.engine.mode | quote }}
+            - --num-blocks
+            - {{ .Values.engine.numBlocks | quote }}
+            - --block-size
+            - {{ .Values.engine.blockSize | quote }}
+            - --max-num-seqs
+            - {{ .Values.engine.maxNumSeqs | quote }}
+            - --max-batched-tokens
+            - {{ .Values.engine.maxBatchedTokens | quote }}
+            - --chunk
+            - {{ .Values.engine.prefillChunk | quote }}
+            {{- if not .Values.engine.prefixCaching }}
+            - --no-prefix-cache
+            {{- end }}
+            {{- with .Values.engine.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          # Weight loading can take a while; the startup probe holds off the
+          # readiness and liveness probes until the server answers /readyz once.
+          startupProbe:
+            httpGet: { path: /readyz, port: http }
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          # /readyz goes 503 on SIGTERM so traffic drains before the process exits.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          # Liveness must NOT hit /readyz: a draining pod is unready but alive.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+              {{- if .Values.gpu.enabled }}
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+              {{- end }}
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- if .Values.gpu.enabled }}
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+              {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          {{- if .Values.model.volume.persistentVolumeClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.model.volume.persistentVolumeClaim }}
+          {{- else }}
+          hostPath:
+            path: {{ .Values.model.volume.hostPath }}
+            type: Directory
+          {{- end }}
+        - name: tmp
+          emptyDir: {}

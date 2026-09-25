@@ -1,0 +1,32 @@
+{{- if .Values.keda.enabled }}
+# Scale on queue depth rather than CPU or GPU utilization: a saturated engine
+# shows up as requests waiting in the scheduler, while its CPU stays idle and
+# its GPU reads ~100% busy whether one or fifty sequences are running.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "engine.fullname" . }}
+  labels: {{- include "engine.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "engine.fullname" . }}
+  minReplicaCount: {{ .Values.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.keda.maxReplicas }}
+  pollingInterval: {{ .Values.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+        scaleDown:
+          # GPU nodes are slow and expensive to replace; shed capacity gently.
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusAddress | quote }}
+        query: |
+          avg(engine_queue_depth{app_kubernetes_io_instance="{{ .Release.Name }}"})
+        threshold: {{ .Values.keda.queueDepthThreshold | quote }}
+{{- end }}

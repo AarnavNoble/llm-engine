@@ -1,0 +1,94 @@
+image:
+  repository: engine
+  tag: gpu
+  pullPolicy: IfNotPresent
+
+# Number of replicas when autoscaling is disabled. With KEDA enabled this is
+# only the starting point; the ScaledObject owns the replica count afterwards.
+replicaCount: 1
+
+backend: cuda           # cuda | cpu — must match the image target
+modelPath: /models/Qwen2.5-0.5B-Instruct
+
+# Engine flags. Defaults mirror src/main.cpp; override per cluster.
+engine:
+  mode: continuous      # continuous | static
+  numBlocks: 4096       # 4096 * 16 = 65536 KV token slots
+  blockSize: 16
+  prefixCaching: true
+  maxNumSeqs: 64
+  maxBatchedTokens: 4096
+  prefillChunk: 512
+  extraArgs: []
+
+service:
+  type: ClusterIP
+  port: 8000
+
+# One GPU per pod. The engine is single-GPU by design, so this is a hard 1.
+gpu:
+  enabled: true
+  resourceName: nvidia.com/gpu
+  count: 1
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    memory: 16Gi
+
+# Weights are mounted, never baked into the image. Pick one source.
+model:
+  volume:
+    # hostPath suits a single-node k3s box; use persistentVolumeClaim on a real cluster.
+    hostPath: /opt/models
+    # persistentVolumeClaim: engine-models
+
+nodeSelector: {}
+# The nvidia.com/gpu toleration is added automatically when gpu.enabled is true;
+# anything listed here is appended. A CPU deployment must not tolerate the GPU
+# taint, or it can be scheduled onto an expensive GPU node and waste it.
+tolerations: []
+affinity: {}
+
+# Loading weights takes seconds to minutes, so readiness is gated by a startup
+# probe rather than a long initialDelaySeconds on the readiness probe.
+probes:
+  startup:
+    failureThreshold: 60
+    periodSeconds: 5
+  readiness:
+    periodSeconds: 5
+    failureThreshold: 2
+  liveness:
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Give in-flight sequences time to finish after SIGTERM. Longest expected
+# request (max_tokens / slowest inter-token latency) plus headroom.
+terminationGracePeriodSeconds: 120
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+metrics:
+  # Scrape annotations for a plain Prometheus; set serviceMonitor if you run the operator.
+  annotations: true
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+
+# Autoscale on queue depth, not CPU: a GPU pod is saturated long before its CPU is.
+keda:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  # Prometheus endpoint KEDA queries for engine_queue_depth.
+  prometheusAddress: http://prometheus-operated.monitoring.svc:9090
+  # Scale out when the average number of queued requests per pod exceeds this.
+  queueDepthThreshold: "4"
+  # GPU nodes take minutes to come up, so scale in slowly and out eagerly.
+  pollingInterval: 15
+  cooldownPeriod: 300

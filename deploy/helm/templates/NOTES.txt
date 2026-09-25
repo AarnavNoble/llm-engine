@@ -1,0 +1,14 @@
+engine is starting. Weights are expected at {{ .Values.modelPath }} inside the pod.
+
+  kubectl rollout status deploy/{{ include "engine.fullname" . }}
+  kubectl port-forward svc/{{ include "engine.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl localhost:{{ .Values.service.port }}/v1/completions \
+    -H 'content-type: application/json' \
+    -d '{"prompt":"The capital of France is","max_tokens":16}'
+
+Readiness is gated on weight load, so the first pod can take a minute.
+{{- if .Values.keda.enabled }}
+
+Autoscaling on engine_queue_depth via KEDA ({{ .Values.keda.minReplicas }}-{{ .Values.keda.maxReplicas }} replicas),
+querying {{ .Values.keda.prometheusAddress }}.
+{{- end }}
