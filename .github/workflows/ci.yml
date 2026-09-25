@@ -21,3 +21,31 @@ jobs:
       # Model-dependent tests ([model]) need the weights; CI runs the pure-logic suite.
       - name: test
         run: ./build/tests/engine_tests "~[model]"
+
+  deploy-manifests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: lint chart
+        run: helm lint deploy/helm
+      - name: install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+      # Render both the GPU default and the CPU + KEDA variant, then validate
+      # every manifest against the Kubernetes schemas.
+      - name: render and validate
+        run: |
+          helm template eng deploy/helm > /tmp/gpu.yaml
+          helm template eng deploy/helm \
+            --set gpu.enabled=false --set backend=cpu --set image.tag=cpu \
+            --set keda.enabled=true --set metrics.serviceMonitor.enabled=true \
+            --set model.volume.persistentVolumeClaim=engine-models > /tmp/cpu.yaml
+          kubeconform -summary -strict -kubernetes-version 1.30.0 \
+            -ignore-missing-schemas /tmp/gpu.yaml /tmp/cpu.yaml
+      - name: cpu deployment must not tolerate the GPU taint
+        run: |
+          if helm template eng deploy/helm --set gpu.enabled=false | grep -qE 'tolerations|nvidia'; then
+            echo "CPU rendering leaked GPU scheduling hints"; exit 1
+          fi
