@@ -44,6 +44,10 @@ jobs:
             --set model.volume.persistentVolumeClaim=engine-models > /tmp/cpu.yaml
           kubeconform -summary -strict -kubernetes-version 1.30.0 \
             -ignore-missing-schemas /tmp/gpu.yaml /tmp/cpu.yaml
+      # Dashboards and autoscalers fail silently on a renamed metric, so the
+      # references are checked against src/api/metrics.cpp on every push.
+      - name: observability references
+        run: python3 scripts/check_observability.py
       - name: cpu deployment must not tolerate the GPU taint
         run: |
           if helm template eng deploy/helm --set gpu.enabled=false | grep -qE 'tolerations|nvidia'; then
