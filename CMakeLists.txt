@@ -3,6 +3,7 @@ project(engine LANGUAGES CXX)
 
 option(ENGINE_CUDA  "Build the CUDA backend"          OFF)
 option(ENGINE_TESTS "Build unit tests"                ON)
+option(ENGINE_BENCH "Build benchmark tools"           ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +75,13 @@ add_executable(engine src/main.cpp)
 target_link_libraries(engine PRIVATE engine_core)
 if(ENGINE_CUDA)
   target_link_libraries(engine PRIVATE engine_cuda)
+endif()
+
+if(ENGINE_BENCH)
+  # KV-cache efficiency is a property of the allocator, not of the GPU, so it is
+  # measured with a fake model on any machine.
+  add_executable(kv_waste bench/kv_waste.cpp)
+  target_link_libraries(kv_waste PRIVATE engine_core)
 endif()
 
 if(ENGINE_TESTS)
