@@ -83,8 +83,10 @@ StepInput Scheduler::schedule() {
   int budget = cfg_.max_num_batched_tokens;
   stats_.steps++;
 
-  // Static batching: only refill when the batch has fully drained.
-  const bool may_admit = cfg_.continuous || running_.empty();
+  // Static batching: keep filling the current batch until it is full or the
+  // next request will not fit, then run it to completion before reopening.
+  if (!cfg_.continuous && running_.empty()) static_batch_open_ = true;
+  const bool may_admit = cfg_.continuous || static_batch_open_;
 
   // 1. Running sequences. A sequence still mid-prefill (chunked) gets its next
   //    chunk now; sequences past their prompt are collected for decode.
@@ -118,6 +120,13 @@ StepInput Scheduler::schedule() {
   if (may_admit) {
     for (auto& w : waiting_) w->wait_steps++;
     while (admit_one(step, budget)) {}
+    if (!cfg_.continuous && !waiting_.empty()) {
+      // Could not take the next request. If the batch is full, or memory (not
+      // this step's token budget) is the reason, the batch is closed.
+      const bool seq_limit = static_cast<int>(running_.size()) >= cfg_.max_num_seqs;
+      const bool memory_bound = budget > 0 && !running_.empty();
+      if (seq_limit || memory_bound) static_batch_open_ = false;
+    }
     if (!waiting_.empty() && running_.empty() && decode.empty()) {
       // Nothing is running and the head request still cannot be admitted:
       // its prompt is larger than the whole pool. Reject it rather than hang.
@@ -168,6 +177,7 @@ void Scheduler::on_step_done(const StepInput& step, const std::vector<int32_t>& 
       std::all_of(running_.begin(), running_.end(), [](const SequencePtr& p) { return p->is_finished(); })) {
     for (auto& s : running_) { kv_.free(s->block_table); stats_.finished++; }
     running_.clear();
+    static_batch_open_ = true;
   }
 }
 

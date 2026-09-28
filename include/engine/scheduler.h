@@ -5,9 +5,12 @@
 // leave immediately and their blocks return to the pool.
 //
 // `SchedulerConfig::continuous = false` selects the static-batching baseline:
-// a batch is admitted together and nothing new joins until every member is
-// finished (finished members keep their KV blocks, exactly like padded
-// HF generate). Same code path, one flag, so the comparison is honest.
+// requests are admitted until the batch is full (max_num_seqs) or the next one
+// does not fit in memory, after which the batch is closed and nothing new joins
+// until every member has finished. Finished members keep their KV blocks, just
+// like padded HF generate. Filling the batch may take several steps, because a
+// single step's token budget rarely covers every prompt; closing it only once
+// it is actually full keeps the baseline fair.
 #include <deque>
 #include <vector>
 
@@ -60,6 +63,7 @@ class Scheduler {
   KVCacheManager& kv_;
   std::deque<SequencePtr> waiting_;
   std::vector<SequencePtr> running_;
+  bool static_batch_open_ = true;   // static mode: still accepting into this batch
   SchedulerStats stats_;
 };
 

@@ -223,3 +223,76 @@ TEST_CASE("scheduler: kv waste fraction reflects partial blocks") {
   auto st = sch.schedule();
   REQUIRE(sch.kv_waste_fraction() == Catch::Approx(15.0 / 32.0));
 }
+
+TEST_CASE("scheduler: a static batch fills across steps before it closes") {
+  // Token budget of 64 cannot admit five 40-token prompts in one step, so a
+  // fair static baseline must keep admitting until max_num_seqs is reached.
+  KVCacheManager kv(256, 16, false);
+  SchedulerConfig cfg;
+  cfg.continuous = false;
+  cfg.max_num_seqs = 5;
+  cfg.max_num_batched_tokens = 64;
+  Scheduler sch(cfg, kv);
+  std::vector<SequencePtr> seqs;
+  for (int i = 0; i < 6; i++) { seqs.push_back(make_seq(i + 1, 40, 3)); sch.add(seqs.back()); }
+  FakeModel m;
+
+  // One step's 64-token budget covers one whole prompt plus a partial chunk of
+  // the next, so the batch cannot be full after a single step.
+  auto st = sch.schedule();
+  size_t after_first = sch.num_running();
+  REQUIRE(after_first >= 1);
+  REQUIRE(after_first < 5);
+  sch.on_step_done(st, m.run(st));
+  int steps = 1;
+  while (sch.num_running() < 5 && steps < 20) { st = sch.schedule(); sch.on_step_done(st, m.run(st)); steps++; }
+  REQUIRE(sch.num_running() == 5);       // batch kept filling on later steps
+  REQUIRE(steps > 1);
+  REQUIRE(sch.num_waiting() == 1);       // sixth request held back: batch is full
+
+  // Now the batch is closed: the sixth request waits for every member to finish,
+  // including the ones that finish early and keep their slot.
+  while (sch.num_running() > 0) {
+    st = sch.schedule();
+    // Closing the batch stops new admissions; members still mid-prefill keep
+    // getting their remaining chunks, so only the queue must stay untouched.
+    REQUIRE(sch.num_running() <= 5);
+    REQUIRE(sch.num_waiting() == 1);
+    sch.on_step_done(st, m.run(st));
+  }
+  for (int i = 0; i < 5; i++) REQUIRE(seqs[i]->is_finished());
+  REQUIRE(sch.num_waiting() == 1);
+  st = sch.schedule();
+  REQUIRE(st.slices.size() == 1);
+  REQUIRE(st.slices[0].seq == seqs[5].get());
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  REQUIRE(seqs[5]->is_finished());
+  REQUIRE(kv.num_used_blocks() == 0);
+}
+
+TEST_CASE("scheduler: a static batch closes when memory cannot take the next request") {
+  // 8 blocks of 16 = 128 slots; each 40-token prompt needs 3 blocks, so only
+  // two fit. The batch must close on memory rather than spin forever.
+  KVCacheManager kv(8, 16, false);
+  SchedulerConfig cfg;
+  cfg.continuous = false;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 4096;
+  Scheduler sch(cfg, kv);
+  std::vector<SequencePtr> seqs;
+  for (int i = 0; i < 4; i++) { seqs.push_back(make_seq(i + 1, 40, 2)); sch.add(seqs.back()); }
+  FakeModel m;
+  auto st = sch.schedule();
+  REQUIRE(sch.num_running() == 2);
+  REQUIRE(sch.num_waiting() == 2);
+  sch.on_step_done(st, m.run(st));
+  st = sch.schedule();
+  REQUIRE(st.num_prefill_tokens == 0);   // closed: no third admission attempt
+  sch.on_step_done(st, m.run(st));
+  int steps = drive(sch, m);
+  REQUIRE(steps > 0);
+  for (auto& s : seqs) REQUIRE(s->is_finished());
+  REQUIRE(sch.stats().preemptions == 0);
+  REQUIRE(kv.num_used_blocks() == 0);
+}
