@@ -21,7 +21,7 @@ Qwen2.5-0.5B-Instruct, fp16, RTX 4090, 32 concurrent requests, prompt mix 128/51
 
 *Status: the CPU path is complete and verified against PyTorch (`v0.0-cpu`); throughput rows need the CUDA backend.*
 
-The KV-waste column is already measured, because memory efficiency is a property of the allocator rather than of the GPU. Against a contiguous allocator on the same workload and memory budget, paged allocation reaches **98.8% slot utilization versus 55.5%**, and continuous batching keeps **41.1 sequences decoding per step versus 14.6** for static batching. Full table, protocol, and an explanation of which rows cannot honestly be measured on a CPU are in [docs/benchmarks.md](docs/benchmarks.md).
+The KV-waste column is already measured, because memory efficiency is a property of the allocator rather than of the GPU. Against a contiguous allocator on the same workload and memory budget, paged allocation reaches **98.8% slot utilization versus 55.5%**, and continuous batching keeps **41.1 sequences decoding per step versus 14.6** for static batching. Prefix caching is measurable too, because a cache hit removes prefill work rather than rescheduling it: across 32 requests sharing a 512-token system prompt, it cut **TTFT p50 by 2.5x** at a 75% block hit ratio. Full table, protocol, and an explanation of which rows cannot honestly be measured on a CPU are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
 

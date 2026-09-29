@@ -62,6 +62,34 @@ a batched GEMM. That only exists on the CUDA backend, so the throughput rows of
 the table stay empty until the kernels are written. Publishing a CPU tokens/s
 comparison as evidence for continuous batching would be meaningless.
 
+**Prefix caching: measurable on CPU, because it removes work.** A cache hit
+skips prefill for the shared blocks outright, so the saving is arithmetic
+rather than a scheduling or batching effect. `scripts/bench_prefix.sh` runs 32
+requests that share a 512-token system prompt and differ only in a 128-token
+tail, once with the cache enabled and once with `--no-prefix-cache`, on
+otherwise identical servers.
+
+Mac, CPU backend, 8 concurrent, 8 output tokens:
+
+| | cache off | cache on | change |
+|---|---|---|---|
+| TTFT p50 | 18,019 ms | 7,284 ms | **2.5x faster** |
+| TTFT p95 | 20,973 ms | 10,267 ms | 2.0x faster |
+| end-to-end p50 | 23.3 s | 10.2 s | 2.3x faster |
+| wall clock | 93.9 s | 42.7 s | 2.2x faster |
+
+Hit ratio was 75%: 960 of 1,280 full prompt blocks. The ceiling for this
+workload is 77.5% — 32 of every 40 prompt blocks are shared, and the very
+first request necessarily misses. The remaining gap is the cold start: with
+eight concurrent requests, the first few begin prefilling before any block has
+been published, so they cannot share with each other. Blocks are published as
+each one fills, which is why only two requests missed rather than all eight.
+
+The tokens/s figures in this experiment (2.7 to 6.0) are not a decode
+throughput claim. Each request generates only 8 tokens against a 640-token
+prompt, so the measurement is dominated by prefill; that is deliberate, since
+prefill is what prefix caching changes.
+
 **A side effect worth recording.** On a backend that does not batch, continuous
 batching still changes *who waits*. Same workload, bimodal output lengths:
 

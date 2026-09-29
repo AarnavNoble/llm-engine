@@ -1,0 +1,31 @@
+[
+  {
+    "tag": "prefix-on",
+    "concurrency": 8,
+    "num_requests": 32,
+    "output_len": 8,
+    "output_dist": "fixed",
+    "mean_output_len": 8.0,
+    "max_output_len": 8,
+    "rate": 0.0,
+    "shared_prefix": 512,
+    "wall_s": 42.72442724998109,
+    "tokens_per_s": 5.991888399161941,
+    "requests_per_s": 0.7489860498952426,
+    "ttft_p50_ms": 7283.6598955327645,
+    "ttft_p95_ms": 10266.68343314086,
+    "itl_p50_ms": 339.53431248664856,
+    "itl_p95_ms": 437.6228526525665,
+    "e2e_p50_s": 10.239529250538908,
+    "e2e_p95_s": 12.849783110339194,
+    "preemptions": 0.0,
+    "prefix_hit_blocks": 960.0,
+    "prefix_total_blocks": 1280.0,
+    "kv_waste_fraction_last": 0.0,
+    "short_third_e2e_p50_s": 12.849278645473532,
+    "short_third_e2e_p95_s": 12.849904064135625,
+    "short_third_mean_out_len": 8.0,
+    "long_third_e2e_p50_s": 12.849278645473532,
+    "long_third_mean_out_len": 8.0
+  }
+]
