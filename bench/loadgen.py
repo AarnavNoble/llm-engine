@@ -12,6 +12,18 @@ import argparse, asyncio, json, random, statistics, time, pathlib, re
 import aiohttp
 
 MIX = [(128, 0.5), (512, 0.3), (1024, 0.2)]
+
+# Output lengths must vary. With one fixed length every request finishes on the
+# same step, which hides the entire cost of static batching: nothing is ever
+# waiting behind a longer neighbour.
+def output_lengths(n, mean, dist, rng):
+    if dist == "fixed":
+        return [mean] * n
+    if dist == "geometric":
+        return [min(max(1, rng.expovariate(1.0 / mean).__trunc__() + 1), 8 * mean) for _ in range(n)]
+    if dist == "bimodal":  # a few long generations among many short ones
+        return [mean * 6 if rng.random() < 0.15 else max(1, mean // 2) for _ in range(n)]
+    raise SystemExit(f"unknown --output-dist {dist}")
 FILLER = ("The paged KV cache stores keys and values in fixed-size blocks so that memory is allocated on demand "
           "and freed as soon as a sequence finishes, which removes the fragmentation of contiguous allocation. ")
 
@@ -30,19 +42,24 @@ async def one(session, url, ids, out_len, ignore_eos, rec):
             if first is None: first = now
             else: rec["itl"].append(now - last)
             last = now; n += 1
-    rec["ttft"].append(first - t0); rec["e2e"].append(last - t0); rec["tokens"] += n - 1  # last chunk is the finish frame
+    # n counts every SSE frame; the last one carries finish_reason, not a token.
+    rec["ttft"].append(first - t0); rec["e2e"].append(last - t0); rec["tokens"] += max(n - 1, 0)
+    rec["per_request"].append({"out_len": out_len, "ttft": first - t0, "e2e": last - t0})
 
 async def main(a):
     random.seed(a.seed)
     tok_bank = list(range(1000, 30000, 7))
     lens = [random.choices([m[0] for m in MIX], [m[1] for m in MIX])[0] for _ in range(a.num_requests)]
     if a.prompt_len: lens = [a.prompt_len] * a.num_requests
+    outs = output_lengths(a.num_requests, a.output_len, a.output_dist, random.Random(a.seed + 1))
     if a.shared_prefix:
         prefix = make_prompt_ids(a.shared_prefix, tok_bank[::3])
-    rec = {"ttft": [], "itl": [], "e2e": [], "tokens": 0}
+    rec = {"ttft": [], "itl": [], "e2e": [], "tokens": 0, "per_request": []}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as s:
         # warmup
-        await asyncio.gather(*[one(s, a.url, make_prompt_ids(64, tok_bank), 16, True, {"ttft": [], "itl": [], "e2e": [], "tokens": 0}) for _ in range(min(8, a.concurrency))])
+        warm = {"ttft": [], "itl": [], "e2e": [], "tokens": 0, "per_request": []}
+        await asyncio.gather(*[one(s, a.url, make_prompt_ids(64, tok_bank), 16, True, warm)
+                               for _ in range(min(8, a.concurrency))])
         m0 = await (await s.get(a.url + "/metrics")).text()
         t0 = time.perf_counter()
         sem = asyncio.Semaphore(a.concurrency)
@@ -51,7 +68,7 @@ async def main(a):
             async with sem:
                 ids = make_prompt_ids(lens[i], tok_bank[i % 50:] + tok_bank[:i % 50])
                 if a.shared_prefix: ids = prefix + ids[: max(1, lens[i] - a.shared_prefix)]
-                await one(s, a.url, ids, a.output_len, True, rec)
+                await one(s, a.url, ids, outs[i], True, rec)
         tasks = []
         for i in range(a.num_requests):
             if a.rate: await asyncio.sleep(random.expovariate(a.rate))
@@ -62,8 +79,14 @@ async def main(a):
     def metric(txt, name):
         m = re.search(rf"^{name} ([0-9.e+-]+)$", txt, re.M); return float(m.group(1)) if m else float("nan")
     pct = lambda xs, p: statistics.quantiles(xs, n=100)[p - 1] if len(xs) > 1 else (xs[0] if xs else float("nan"))
+    # Latency of the shortest requests is the head-of-line blocking signal: under
+    # static batching they cannot leave until the longest request in the batch does.
+    short = sorted(rec["per_request"], key=lambda r: r["out_len"])[: max(1, len(rec["per_request"]) // 3)]
+    long_ = sorted(rec["per_request"], key=lambda r: -r["out_len"])[: max(1, len(rec["per_request"]) // 3)]
     res = {
-        "tag": a.tag, "concurrency": a.concurrency, "num_requests": a.num_requests, "output_len": a.output_len, "rate": a.rate,
+        "tag": a.tag, "concurrency": a.concurrency, "num_requests": a.num_requests, "output_len": a.output_len,
+        "output_dist": a.output_dist, "mean_output_len": sum(outs) / len(outs), "max_output_len": max(outs),
+        "rate": a.rate,
         "shared_prefix": a.shared_prefix, "wall_s": wall,
         "tokens_per_s": rec["tokens"] / wall, "requests_per_s": a.num_requests / wall,
         "ttft_p50_ms": 1000 * pct(rec["ttft"], 50), "ttft_p95_ms": 1000 * pct(rec["ttft"], 95),
@@ -73,6 +96,11 @@ async def main(a):
         "prefix_hit_blocks": metric(m1, "engine_prefix_cache_hit_blocks_total") - metric(m0, "engine_prefix_cache_hit_blocks_total"),
         "prefix_total_blocks": metric(m1, "engine_prefix_cache_total_blocks_total") - metric(m0, "engine_prefix_cache_total_blocks_total"),
         "kv_waste_fraction_last": metric(m1, "engine_kv_waste_fraction"),
+        "short_third_e2e_p50_s": pct([r["e2e"] for r in short], 50),
+        "short_third_e2e_p95_s": pct([r["e2e"] for r in short], 95),
+        "short_third_mean_out_len": sum(r["out_len"] for r in short) / len(short),
+        "long_third_e2e_p50_s": pct([r["e2e"] for r in long_], 50),
+        "long_third_mean_out_len": sum(r["out_len"] for r in long_) / len(long_),
     }
     print(json.dumps(res, indent=2))
     if a.tag:
@@ -88,7 +116,9 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default="")
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--num-requests", type=int, default=256)
-    ap.add_argument("--output-len", type=int, default=128)
+    ap.add_argument("--output-len", type=int, default=128, help="mean output length")
+    ap.add_argument("--output-dist", default="geometric", choices=["fixed", "geometric", "bimodal"],
+                    help="fixed hides static batching's cost; see output_lengths()")
     ap.add_argument("--prompt-len", type=int, default=0, help="fixed prompt length instead of the 128/512/1024 mix")
     ap.add_argument("--rate", type=float, default=0.0, help="Poisson arrival rate (req/s); 0 = closed loop")
     ap.add_argument("--shared-prefix", type=int, default=0, help="prepend a shared N-token prefix (prefix-cache experiment)")

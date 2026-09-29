@@ -1,0 +1,31 @@
+[
+  {
+    "tag": "cpu-static",
+    "concurrency": 16,
+    "num_requests": 32,
+    "output_len": 16,
+    "output_dist": "bimodal",
+    "mean_output_len": 24.5,
+    "max_output_len": 96,
+    "rate": 0.0,
+    "shared_prefix": 0,
+    "wall_s": 62.33428420894779,
+    "tokens_per_s": 12.577348243415948,
+    "requests_per_s": 0.5133611527924877,
+    "ttft_p50_ms": 4040.6142289866693,
+    "ttft_p95_ms": 17217.724235658534,
+    "itl_p50_ms": 302.3530205246061,
+    "itl_p95_ms": 1228.645729017444,
+    "e2e_p50_s": 24.539012312481645,
+    "e2e_p95_s": 51.113605829549485,
+    "preemptions": 0.0,
+    "prefix_hit_blocks": 4.0,
+    "prefix_total_blocks": 192.0,
+    "kv_waste_fraction_last": 0.0,
+    "short_third_e2e_p50_s": 11.063062916975468,
+    "short_third_e2e_p95_s": 11.787685950117885,
+    "short_third_mean_out_len": 8.0,
+    "long_third_e2e_p50_s": 24.626209792040754,
+    "long_third_mean_out_len": 60.8
+  }
+]

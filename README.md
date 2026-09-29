@@ -19,7 +19,9 @@ Qwen2.5-0.5B-Instruct, fp16, RTX 4090, 32 concurrent requests, prompt mix 128/51
 | `v0.6-graphs` + CUDA graphs | | | | |
 | vLLM, same model and GPU (reference) | | | | |
 
-*Status: CPU reference path complete and verified against PyTorch (`v0.0-cpu`). GPU rows land as the CUDA backend is built; see the schedule in `docs/design.md`.*
+*Status: the CPU path is complete and verified against PyTorch (`v0.0-cpu`); throughput rows need the CUDA backend.*
+
+The KV-waste column is already measured, because memory efficiency is a property of the allocator rather than of the GPU. Against a contiguous allocator on the same workload and memory budget, paged allocation reaches **98.8% slot utilization versus 55.5%**, and continuous batching keeps **41.1 sequences decoding per step versus 14.6** for static batching. Full table, protocol, and an explanation of which rows cannot honestly be measured on a CPU are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
 
@@ -53,6 +55,8 @@ CPU-only build (default) needs CMake ≥ 3.24, a C++17 compiler and optionally B
 
 `engine generate --model DIR --chat "Explain paged attention" --max-tokens 64` runs a one-off completion; `--copies 8` runs eight concurrently through the batcher.
 
+Deployment lives in [`deploy/`](deploy): a multi-stage Dockerfile with `gpu` and `cpu` targets, a Helm chart that requests one GPU per pod and splits startup/readiness/liveness probes so a draining pod is never killed mid-request, a KEDA ScaledObject that scales on `engine_queue_depth`, and a Grafana dashboard. `scripts/check_observability.py` runs in CI and fails the build if a dashboard panel or the autoscaler query references a metric the server does not expose.
+
 ## Correctness
 
 `reference/dump_logits.py` runs the Hugging Face model in fp32 on 22 fixed prompts and dumps the residual stream after every layer plus final logits. `tests/test_cpu_model.cpp` replays the same prompts through the engine's forward pass and checks:
@@ -62,6 +66,8 @@ CPU-only build (default) needs CMake ≥ 3.24, a C++17 compiler and optionally B
 - 16-token greedy generation through the scheduler with 6 sequences batched together: identical to `generate()`
 
 The tokenizer is checked token-for-token against `tokenizers` on a 75-line corpus (CJK, emoji, contractions, whitespace runs, chat templates).
+
+`scripts/e2e_smoke.py` runs 40 checks against a live server process: both endpoints, SSE framing, error codes, the metrics surface, prefix-cache hits observed through the metrics delta, and a SIGTERM mid-generation that must leave readiness at 503, refuse new work, and still return every token of the in-flight request.
 
 ## Serving features
 
