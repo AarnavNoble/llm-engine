@@ -90,6 +90,38 @@ throughput claim. Each request generates only 8 tokens against a 640-token
 prompt, so the measurement is dominated by prefill; that is deliberate, since
 prefill is what prefix caching changes.
 
+**Chunked prefill: what it does and does not buy.** A long prompt must be
+prefilled before it can generate. If the whole prompt goes into one forward
+pass, every sequence already decoding waits for that pass and sees one enormous
+gap between tokens. `scripts/bench_chunked_prefill.py` holds four streams
+decoding, injects a 2,048-token prompt mid-flight, and measures the streams'
+inter-token gaps around the injection, for several chunk sizes on otherwise
+identical servers. Prefix caching is disabled so the prefill cost is real.
+
+Mac, CPU backend:
+
+| chunk | ITL p50 | ITL p95 | worst gap | injected prompt TTFT |
+|---|---|---|---|---|
+| 2048 (effectively unchunked) | 152 ms | 314 ms | **23,972 ms** | 24.38 s |
+| 512 | 148 ms | 6,955 ms | 9,895 ms | 24.30 s |
+| 128 | 148 ms | **2,556 ms** | **2,785 ms** | 25.00 s |
+
+The worst-case stall falls 8.6x, from 24.0 s to 2.8 s, and the arriving
+request's own TTFT is barely affected (24.4 s to 25.0 s, about 2.5%).
+
+The p95 column moves the other way, and that is not a contradiction. Total
+prefill work is conserved: chunking does not make the prompt cheaper, it splits
+one catastrophic stall into many small ones. Unchunked there is exactly one
+24-second gap, which barely registers in a p95 over roughly 150 samples; at
+chunk 512 there are four gaps of several seconds each, so more of the
+distribution is affected even though the worst case is far better. The metric
+that matters to a user watching tokens appear is the worst gap, not p95, and
+reporting p95 alone here would hide the entire effect.
+
+Absolute numbers are CPU-bound and will shrink by orders of magnitude on the
+GPU; what should carry over is the shape, with the worst stall bounded by the
+chunk size rather than by the prompt length.
+
 **A side effect worth recording.** On a backend that does not batch, continuous
 batching still changes *who waits*. Same workload, bimodal output lengths:
 
