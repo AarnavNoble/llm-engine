@@ -153,6 +153,7 @@ TEST_CASE("scheduler: preemption under memory pressure recomputes and resumes at
   // 6 blocks of 16 = 96 slots. Two prompts of 40 tokens each need 3 blocks each -> pool full.
   KVCacheManager kv(6, 16, false);
   SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;
+  cfg.watermark_blocks = 0;  // this test is about the preemption path itself
   Scheduler sch(cfg, kv);
   auto a = make_seq(1, 40, 20), b = make_seq(2, 40, 20);
   sch.add(a); sch.add(b);
@@ -301,6 +302,7 @@ TEST_CASE("scheduler: preemption accounts for the work it throws away") {
   // Same setup as the preemption test: two 40-token prompts in 6 blocks of 16.
   KVCacheManager kv(6, 16, false);
   SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;
+  cfg.watermark_blocks = 0;  // this test is about the preemption path itself
   Scheduler sch(cfg, kv);
   auto a = make_seq(1, 40, 20), b = make_seq(2, 40, 20);
   sch.add(a); sch.add(b);
@@ -320,4 +322,82 @@ TEST_CASE("scheduler: preemption accounts for the work it throws away") {
   REQUIRE(b->num_generated() == 20);
   // Recomputed work is bounded by what the victim had at preemption time.
   REQUIRE(sch.stats().recomputed_tokens < 120);
+}
+
+TEST_CASE("scheduler: the admission watermark prevents preempt thrash") {
+  // 6 blocks of 16. Each 40-token prompt needs 3 blocks, so two fit exactly and
+  // leave no headroom for either to cross its next block boundary.
+  auto run = [](int watermark, int* preemptions, int* admitted_first_step) {
+    static KVCacheManager* kvp = nullptr;
+    KVCacheManager kv(6, 16, false);
+    SchedulerConfig cfg; cfg.max_num_batched_tokens = 512; cfg.watermark_blocks = watermark;
+    Scheduler sch(cfg, kv);
+    auto a = make_seq(1, 40, 20), b = make_seq(2, 40, 20);
+    sch.add(a); sch.add(b);
+    FakeModel m;
+    auto st = sch.schedule();
+    *admitted_first_step = static_cast<int>(sch.num_running());
+    sch.on_step_done(st, m.run(st));
+    drive(sch, m);
+    *preemptions = static_cast<int>(sch.stats().preemptions);
+    REQUIRE(a->num_generated() == 20);
+    REQUIRE(b->num_generated() == 20);     // both still complete either way
+    REQUIRE(kv.num_used_blocks() == 0);
+    (void)kvp;
+  };
+
+  int preempt_off = 0, preempt_on = 0, admitted_off = 0, admitted_on = 0;
+  run(0, &preempt_off, &admitted_off);     // no watermark: admit both, then thrash
+  run(-1, &preempt_on, &admitted_on);      // auto watermark: hold the second back
+
+  REQUIRE(admitted_off == 2);
+  REQUIRE(admitted_on == 1);
+  REQUIRE(preempt_off > 0);
+  REQUIRE(preempt_on == 0);                // the point: no work is thrown away
+}
+
+TEST_CASE("scheduler: the watermark never blocks the first sequence") {
+  // With nothing resident the auto watermark is zero, so a prompt that fits at
+  // all must be admitted; otherwise the engine would deadlock under pressure.
+  KVCacheManager kv(4, 16, false);
+  SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;  // watermark_blocks = -1 (auto)
+  Scheduler sch(cfg, kv);
+  auto s = make_seq(1, 60, 4);             // needs all 4 blocks
+  sch.add(s);
+  FakeModel m;
+  auto st = sch.schedule();
+  REQUIRE(sch.num_running() == 1);
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  REQUIRE(s->num_generated() == 4);
+}
+
+TEST_CASE("scheduler: a reusable prefix does not count against the watermark") {
+  // The second request's prompt is entirely cached, so admitting it allocates
+  // nothing and must not be held back by headroom accounting.
+  KVCacheManager kv(8, 16, true);
+  SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;
+  Scheduler sch(cfg, kv);
+  auto a = make_seq(7, 64, 1);
+  sch.add(a);
+  FakeModel m;
+  drive(sch, m);
+  REQUIRE(kv.num_cached_blocks() == 4);    // 4 full blocks published and retained
+
+  auto keep = make_seq(1, 48, 8);          // occupies 3 blocks, so headroom is tight
+  sch.add(keep);
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));
+  REQUIRE(sch.num_running() == 1);
+  auto b = make_seq(7, 64, 1);             // same tokens as a: fully cached
+  sch.add(b);
+  st = sch.schedule();
+  REQUIRE(sch.num_running() == 2);         // admitted despite the watermark
+  REQUIRE(st.slices[0].seq == b.get());
+  // The whole prompt is cached, but the last token is always recomputed because
+  // the step has to produce logits to sample from.
+  REQUIRE(st.slices[0].start == 63);
+  REQUIRE(st.slices[0].len == 1);
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  REQUIRE(b->is_finished());
 }

@@ -46,6 +46,7 @@ bool Scheduler::admit_one(StepInput& step, int& budget) {
   SequencePtr s = waiting_.front();
 
   if (s->block_table.empty()) {
+    if (!admission_fits(*s)) return false;
     auto cached = kv_.allocate_prompt(s->block_table, s->tokens);
     if (!cached) return false;
     s->num_computed = std::min(*cached, s->num_tokens() - 1);  // always compute >= 1 token so we get logits
@@ -61,6 +62,19 @@ bool Scheduler::admit_one(StepInput& step, int& budget) {
   s->status = SeqStatus::Running;
   stats_.admitted++;
   return true;
+}
+
+// Would admitting `s` leave enough free blocks for the resident sequences to
+// reach their next block boundary? Reusable prefix blocks are free of charge,
+// so only the blocks that must actually be allocated count against the pool.
+bool Scheduler::admission_fits(const Sequence& s) const {
+  const int watermark = cfg_.watermark_blocks >= 0 ? cfg_.watermark_blocks
+                                                   : static_cast<int>(running_.size());
+  if (watermark == 0) return true;
+  const int bs = kv_.block_size();
+  const int needed = KVCacheManager::blocks_needed(s.num_tokens(), bs);
+  const int reused = kv_.lookup_cached_prefix(s.tokens) / bs;
+  return kv_.num_available_blocks() - (needed - reused) >= watermark;
 }
 
 void Scheduler::preempt_youngest() {

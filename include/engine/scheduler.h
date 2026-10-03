@@ -25,6 +25,13 @@ struct SchedulerConfig {
   int max_num_batched_tokens = 2048; // prefill + decode tokens per step
   int prefill_chunk_size = 512;      // chunked prefill; long prompts are split
   int starvation_wait_steps = 64;    // waiting this many rounds gets priority
+  // Admission watermark: free blocks that must remain after admitting a new
+  // sequence. The engine admits optimistically and preempts reactively, so
+  // without headroom a fresh admission steals the block a resident sequence
+  // needs at its next block boundary, and the pair thrash. -1 keeps one block
+  // per resident sequence, which is exactly what they can collectively need
+  // before the next boundary; 0 disables the check.
+  int watermark_blocks = -1;
 };
 
 struct SchedulerStats {
@@ -59,6 +66,7 @@ class Scheduler {
 
  private:
   bool admit_one(StepInput& step, int& budget);
+  bool admission_fits(const Sequence& s) const;
   void preempt_youngest();
   void retire(SequencePtr seq, FinishReason r);
   void add_prefill_slice(StepInput& step, Sequence& s, int len);
