@@ -32,7 +32,7 @@ class Histogram {
 struct Metrics {
   std::atomic<uint64_t> requests_total{0}, requests_finished{0}, requests_aborted{0};
   std::atomic<uint64_t> prompt_tokens_total{0}, generated_tokens_total{0};
-  std::atomic<uint64_t> steps_total{0}, preemptions_total{0};
+  std::atomic<uint64_t> steps_total{0}, preemptions_total{0}, recomputed_tokens_total{0};
   std::atomic<uint64_t> prefix_cache_queries{0}, prefix_cache_hit_blocks{0}, prefix_cache_total_blocks{0}, kv_evictions{0};
   // gauges, refreshed each step
   std::atomic<int64_t> queue_depth{0}, running_seqs{0};

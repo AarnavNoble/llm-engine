@@ -78,6 +78,7 @@ void Engine::refresh_gauges() {
   metrics_.kv_waste_fraction = scheduler_.kv_waste_fraction();
   metrics_.steps_total = scheduler_.stats().steps;
   metrics_.preemptions_total = scheduler_.stats().preemptions;
+  metrics_.recomputed_tokens_total = scheduler_.stats().recomputed_tokens;
   metrics_.prefix_cache_queries = kv_.stats().prefix_queries;
   metrics_.prefix_cache_hit_blocks = kv_.stats().prefix_hit_blocks;
   metrics_.prefix_cache_total_blocks = kv_.stats().prefix_total_blocks;

@@ -39,6 +39,7 @@ std::string Metrics::render_prometheus() const {
   counter("engine_generated_tokens_total", "Tokens generated", generated_tokens_total);
   counter("engine_steps_total", "Forward passes executed", steps_total);
   counter("engine_preemptions_total", "Sequences preempted for memory", preemptions_total);
+  counter("engine_recomputed_tokens_total", "Tokens discarded by preemption and recomputed", recomputed_tokens_total);
   counter("engine_prefix_cache_queries_total", "Prompts looked up in the prefix cache", prefix_cache_queries);
   counter("engine_prefix_cache_hit_blocks_total", "Prompt blocks served from the prefix cache", prefix_cache_hit_blocks);
   counter("engine_prefix_cache_total_blocks_total", "Full prompt blocks looked up", prefix_cache_total_blocks);

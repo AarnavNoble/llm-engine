@@ -29,6 +29,10 @@ struct SchedulerConfig {
 
 struct SchedulerStats {
   uint64_t steps = 0, preemptions = 0, admitted = 0, finished = 0;
+  // Tokens whose K/V were computed, then discarded by a preemption and have to
+  // be computed again. This is the price of recompute-on-resume, and without it
+  // the preemption counter says how often it happened but not what it cost.
+  uint64_t recomputed_tokens = 0;
 };
 
 class Scheduler {

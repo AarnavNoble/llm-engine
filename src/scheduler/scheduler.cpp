@@ -71,6 +71,7 @@ void Scheduler::preempt_youngest() {
   SequencePtr s = running_.back();
   running_.pop_back();
   kv_.free(s->block_table);
+  stats_.recomputed_tokens += static_cast<uint64_t>(s->num_computed);
   s->num_computed = 0;
   s->num_preemptions++;
   s->status = SeqStatus::Waiting;

@@ -642,7 +642,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Preemptions and evictions",
-      "description": "Sustained preemptions mean KV memory is oversubscribed: lower max_num_seqs or raise num_blocks. Preempted sequences are recomputed from scratch, so this is wasted work.",
+      "description": "Sustained preemptions mean KV memory is oversubscribed: lower max_num_seqs or raise num_blocks. Recomputed tokens are the actual cost, since a preempted sequence loses every token it had computed and must redo them.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -671,6 +671,15 @@
           "expr": "sum(rate(engine_kv_evictions_total{namespace=~\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
           "legendFormat": "KV evictions/s",
           "refId": "R"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(engine_recomputed_tokens_total{namespace=~\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "recomputed tokens/s",
+          "refId": "C"
         }
       ],
       "fieldConfig": {

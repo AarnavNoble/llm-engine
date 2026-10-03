@@ -296,3 +296,28 @@ TEST_CASE("scheduler: a static batch closes when memory cannot take the next req
   REQUIRE(sch.stats().preemptions == 0);
   REQUIRE(kv.num_used_blocks() == 0);
 }
+
+TEST_CASE("scheduler: preemption accounts for the work it throws away") {
+  // Same setup as the preemption test: two 40-token prompts in 6 blocks of 16.
+  KVCacheManager kv(6, 16, false);
+  SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;
+  Scheduler sch(cfg, kv);
+  auto a = make_seq(1, 40, 20), b = make_seq(2, 40, 20);
+  sch.add(a); sch.add(b);
+  FakeModel m;
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));
+  REQUIRE(sch.stats().recomputed_tokens == 0);
+
+  int steps = 0;
+  while (sch.stats().preemptions == 0 && steps < 50) { st = sch.schedule(); sch.on_step_done(st, m.run(st)); steps++; }
+  REQUIRE(sch.stats().preemptions == 1);
+  // The victim lost everything it had computed: its prompt plus what it generated.
+  REQUIRE(sch.stats().recomputed_tokens == static_cast<uint64_t>(40 + b->num_generated() - 1));
+  REQUIRE(b->num_computed == 0);
+
+  drive(sch, m);
+  REQUIRE(a->num_generated() == 20);
+  REQUIRE(b->num_generated() == 20);
+  // Recomputed work is bounded by what the victim had at preemption time.
+  REQUIRE(sch.stats().recomputed_tokens < 120);
+}
