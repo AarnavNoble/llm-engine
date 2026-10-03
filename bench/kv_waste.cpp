@@ -62,6 +62,8 @@ struct Result {
   int peak_resident = 0;
   long long steps = 0;
   long long preemptions = 0;
+  long long recomputed_tokens = 0;   // work thrown away by preemption
+  long long useful_tokens = 0;       // prompt + generated tokens actually delivered
 };
 
 // ---- paged: drive the real scheduler and allocator ----
@@ -112,6 +114,8 @@ Result run_paged(const Workload& w, int num_blocks, int block_size, const Schedu
   r.mean_resident = r.steps ? static_cast<double>(resident_sum) / static_cast<double>(r.steps) : 0;
   r.mean_active = r.steps ? static_cast<double>(active_sum) / static_cast<double>(r.steps) : 0;
   r.preemptions = static_cast<long long>(sch.stats().preemptions);
+  r.recomputed_tokens = static_cast<long long>(sch.stats().recomputed_tokens);
+  for (size_t i = 0; i < w.prompt_len.size(); i++) r.useful_tokens += w.prompt_len[i] + w.output_len[i];
   return r;
 }
 
@@ -190,6 +194,26 @@ void print_row(const Result& r) {
               r.mean_resident, r.mean_active, r.peak_resident, r.preemptions);
 }
 
+// Recompute-on-resume is the simplest correct preemption policy, but it is not
+// free: a preempted sequence loses every token it had computed. This sweeps the
+// memory budget to show where that cost starts to matter.
+void sweep_pressure(const Workload& w, int block_size, const SchedulerConfig& cfg) {
+  std::printf("\nrecompute cost against memory pressure (paged, continuous batching)\n");
+  std::printf("| %8s | %9s | %8s | %11s | %14s |\n",
+              "blocks", "slots", "preempt", "recomputed", "wasted work");
+  std::printf("|%s|%s|%s|%s|%s|\n", std::string(10, '-').c_str(), std::string(11, '-').c_str(),
+              std::string(10, '-').c_str(), std::string(13, '-').c_str(), std::string(16, '-').c_str());
+  for (int blocks : {256, 384, 512, 768, 1024, 2048, 4096}) {
+    Result r = run_paged(w, blocks, block_size, cfg, false);
+    if (r.steps == 0) { std::printf("| %8d | %9d | %8s | %11s | %14s |\n",
+                                    blocks, blocks * block_size, "-", "-", "does not fit"); continue; }
+    const double wasted = static_cast<double>(r.recomputed_tokens) /
+                          static_cast<double>(r.recomputed_tokens + r.useful_tokens);
+    std::printf("| %8d | %9d | %8lld | %11lld | %13.1f%% |\n",
+                blocks, blocks * block_size, r.preemptions, r.recomputed_tokens, 100.0 * wasted);
+  }
+}
+
 void emit_json(const std::string& path, const std::vector<Result>& rs, const Workload& w,
                long long slots, int block_size) {
   FILE* f = std::fopen(path.c_str(), "w");
@@ -201,10 +225,10 @@ void emit_json(const std::string& path, const std::vector<Result>& rs, const Wor
   for (size_t i = 0; i < rs.size(); i++) {
     std::fprintf(f, "    {\"strategy\": \"%s\", \"slot_utilization\": %.4f, \"kv_waste_fraction\": %.4f,"
                     " \"mean_resident_seqs\": %.2f, \"mean_active_seqs\": %.2f, \"peak_resident_seqs\": %d,"
-                    " \"steps\": %lld, \"preemptions\": %lld}%s\n",
+                    " \"steps\": %lld, \"preemptions\": %lld, \"recomputed_tokens\": %lld}%s\n",
                  rs[i].strategy.c_str(), rs[i].slot_utilization, 1.0 - rs[i].slot_utilization,
                  rs[i].mean_resident, rs[i].mean_active, rs[i].peak_resident, rs[i].steps, rs[i].preemptions,
-                 i + 1 < rs.size() ? "," : "");
+                 rs[i].recomputed_tokens, i + 1 < rs.size() ? "," : "");
   }
   std::fprintf(f, "  ]\n}\n");
   std::fclose(f);
@@ -215,7 +239,7 @@ void emit_json(const std::string& path, const std::vector<Result>& rs, const Wor
 
 int main(int argc, char** argv) {
   int requests = 512, blocks = 4096, block_size = 16, output_len = 128, max_num_seqs = 64;
-  bool fixed_output = false;
+  bool fixed_output = false, sweep = false;
   std::string json_out = "bench/results/kv-waste.json";
   for (int i = 1; i < argc; i++) {
     auto val = [&] { return std::atoi(argv[++i]); };
@@ -225,6 +249,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--output-len")) output_len = val();
     else if (!std::strcmp(argv[i], "--max-num-seqs")) max_num_seqs = val();
     else if (!std::strcmp(argv[i], "--fixed-output")) fixed_output = true;
+    else if (!std::strcmp(argv[i], "--sweep")) sweep = true;
     else if (!std::strcmp(argv[i], "--json")) json_out = argv[++i];
     else { std::fprintf(stderr, "unknown flag %s\n", argv[i]); return 2; }
   }
@@ -282,6 +307,7 @@ int main(int argc, char** argv) {
   std::printf("sequences decoding per step: %.1f paged+continuous vs %.1f paged+static (%.1fx),"
               " %.1f contiguous+continuous\n", best.mean_active, rs[3].mean_active,
               best.mean_active / std::max(rs[3].mean_active, 1e-9), fair.mean_active);
+  if (sweep) sweep_pressure(w, block_size, cfg);
   emit_json(json_out, rs, w, slots, block_size);
   return 0;
 }

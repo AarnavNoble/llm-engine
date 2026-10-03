@@ -122,6 +122,47 @@ Absolute numbers are CPU-bound and will shrink by orders of magnitude on the
 GPU; what should carry over is the shape, with the worst stall bounded by the
 chunk size rather than by the prompt length.
 
+**Preemption is not free, and the engine was not measuring what it cost.**
+`engine_preemptions_total` said how often a sequence was evicted but not how
+much work that destroyed. Recompute-on-resume discards every token the victim
+had computed, so the cost is now counted directly as
+`engine_recomputed_tokens_total` and reported by `kv_waste --sweep`.
+
+256 requests, geometric outputs around 128, `max_num_seqs` 64, varying the pool:
+
+| blocks | KV slots | preemptions | recomputed tokens | wasted work |
+|---|---|---|---|---|
+| 256 | 4,096 | 86 | 36,254 | 20.6% |
+| 384 | 6,144 | 71 | 28,803 | 17.1% |
+| 512 | 8,192 | 71 | 28,358 | 16.9% |
+| 768 | 12,288 | 72 | 25,448 | 15.4% |
+| 1,024 | 16,384 | 84 | 31,338 | 18.3% |
+| 2,048 | 32,768 | 24 | 10,422 | 7.0% |
+| 4,096 | 65,536 | 0 | 0 | 0.0% |
+
+Wasted work is recomputed tokens over recomputed plus delivered tokens. Note
+that the curve is not monotonic: 1,024 blocks wastes more than 768. That is
+thrash rather than noise, and holding the budget fixed at 8,192 slots while
+varying the sequence cap shows why:
+
+| `max_num_seqs` | decoding seqs | preemptions |
+|---|---|---|
+| 8 | 7.7 | **0** |
+| 16 | 13.5 | 40 |
+| 32 | 14.0 | 71 |
+| 64 | 14.0 | 71 |
+
+Past 32 the cap stops mattering because memory is the binding constraint. The
+interesting region is 16 to 32: raising the cap buys 0.5 more sequences
+decoding and doubles the preemptions. The engine admits optimistically and
+preempts reactively, so whenever the cap exceeds what memory can hold it
+oscillates, paying full recompute for a negligible occupancy gain.
+
+The fix is admission control rather than a bigger pool: refuse to admit a new
+sequence unless some watermark of free blocks remains, which is what vLLM does.
+That is the next scheduler change worth making, and the metric to judge it by
+now exists.
+
 **A side effect worth recording.** On a backend that does not batch, continuous
 batching still changes *who waits*. Same workload, bimodal output lengths:
 
