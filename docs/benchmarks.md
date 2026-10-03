@@ -125,43 +125,44 @@ chunk size rather than by the prompt length.
 **Preemption is not free, and the engine was not measuring what it cost.**
 `engine_preemptions_total` said how often a sequence was evicted but not how
 much work that destroyed. Recompute-on-resume discards every token the victim
-had computed, so the cost is now counted directly as
+had computed, so the cost is counted directly as
 `engine_recomputed_tokens_total` and reported by `kv_waste --sweep`.
 
-256 requests, geometric outputs around 128, `max_num_seqs` 64, varying the pool:
-
-| blocks | KV slots | preemptions | recomputed tokens | wasted work |
-|---|---|---|---|---|
-| 256 | 4,096 | 86 | 36,254 | 20.6% |
-| 384 | 6,144 | 71 | 28,803 | 17.1% |
-| 512 | 8,192 | 71 | 28,358 | 16.9% |
-| 768 | 12,288 | 72 | 25,448 | 15.4% |
-| 1,024 | 16,384 | 84 | 31,338 | 18.3% |
-| 2,048 | 32,768 | 24 | 10,422 | 7.0% |
-| 4,096 | 65,536 | 0 | 0 | 0.0% |
-
-Wasted work is recomputed tokens over recomputed plus delivered tokens. Note
-that the curve is not monotonic: 1,024 blocks wastes more than 768. That is
-thrash rather than noise, and holding the budget fixed at 8,192 slots while
-varying the sequence cap shows why:
-
-| `max_num_seqs` | decoding seqs | preemptions |
-|---|---|---|
-| 8 | 7.7 | **0** |
-| 16 | 13.5 | 40 |
-| 32 | 14.0 | 71 |
-| 64 | 14.0 | 71 |
-
-Past 32 the cap stops mattering because memory is the binding constraint. The
-interesting region is 16 to 32: raising the cap buys 0.5 more sequences
-decoding and doubles the preemptions. The engine admits optimistically and
-preempts reactively, so whenever the cap exceeds what memory can hold it
-oscillates, paying full recompute for a negligible occupancy gain.
+Measuring it immediately exposed a design flaw. The engine admitted
+optimistically and preempted reactively, so a fresh admission would steal the
+block a resident sequence needed at its next boundary, and the pair would
+thrash. Wasted work did not even fall monotonically with pool size: 1,024
+blocks wasted more than 768. Holding the budget at 8,192 slots and varying only
+the sequence cap showed the mechanism — past 32 the cap is irrelevant because
+memory binds, yet going from 16 to 32 bought half a sequence of occupancy and
+doubled the preemptions.
 
 The fix is admission control rather than a bigger pool: refuse to admit a new
-sequence unless some watermark of free blocks remains, which is what vLLM does.
-That is the next scheduler change worth making, and the metric to judge it by
-now exists.
+sequence unless enough free blocks remain for the resident sequences to each
+reach their next block boundary, which is one block apiece. Reusable prefix
+blocks cost nothing to adopt, so they do not count against the headroom, and
+with nothing resident the watermark is zero, so a prompt that fits at all is
+always admitted and the engine cannot deadlock. `SchedulerConfig::watermark_blocks`
+defaults to this automatic policy; 0 restores the old behaviour.
+
+256 requests, geometric outputs around 128, `max_num_seqs` 64, wasted work as a
+fraction of all token work:
+
+| blocks | KV slots | preemptions before → after | wasted work before → after |
+|---|---|---|---|
+| 256 | 4,096 | 86 → 30 | 20.6% → **8.1%** |
+| 384 | 6,144 | 71 → 18 | 17.1% → **6.1%** |
+| 512 | 8,192 | 71 → 11 | 16.9% → **3.2%** |
+| 768 | 12,288 | 72 → 5 | 15.4% → **1.1%** |
+| 1,024 | 16,384 | 84 → 1 | 18.3% → **0.1%** |
+| 2,048 | 32,768 | 24 → 0 | 7.0% → **0.0%** |
+| 4,096 | 65,536 | 0 → 0 | 0.0% → 0.0% |
+
+The curve is now monotonic, as it should be, and the cost of the fix is almost
+nothing: at 8,192 slots the sequences decoding per step went from 14.0 to 13.9,
+a 0.7% loss of occupancy in exchange for 6.5x fewer preemptions. At the tightest
+budget, where the engine is genuinely oversubscribed, preemption still happens —
+the watermark reduces thrash, it cannot create memory that is not there.
 
 **A side effect worth recording.** On a backend that does not batch, continuous
 batching still changes *who waits*. Same workload, bimodal output lengths:
