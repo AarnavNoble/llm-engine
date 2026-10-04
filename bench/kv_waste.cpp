@@ -36,13 +36,18 @@ struct Workload {
 // Output lengths are geometric around the mean unless --fixed-output is given:
 // with identical output lengths every sequence finishes on the same step, which
 // hides the entire cost of static batching and would flatter the comparison.
-Workload make_workload(int n, int mean_output, bool fixed_output, uint64_t seed) {
+Workload make_workload(int n, int mean_output, bool fixed_output, uint64_t seed, bool hol) {
   Workload w;
   w.mean_output = mean_output;
   std::mt19937_64 rng(seed);
-  std::discrete_distribution<int> pick({0.5, 0.3, 0.2});
+  // The head-of-line mix is deliberately adversarial for strict FCFS: mostly
+  // tiny prompts with a tenth of them large enough to need most of a small pool.
+  std::discrete_distribution<int> pick(hol ? std::initializer_list<double>{0.45, 0.45, 0.10}
+                                           : std::initializer_list<double>{0.5, 0.3, 0.2});
   std::geometric_distribution<int> out(1.0 / std::max(mean_output, 1));
-  const int lens[3] = {128, 512, 1024};
+  const int small[3] = {64, 96, 2048};
+  const int mixed[3] = {128, 512, 1024};
+  const int* lens = hol ? small : mixed;
   w.prompt_len.reserve(n);
   w.output_len.reserve(n);
   for (int i = 0; i < n; i++) {
@@ -89,9 +94,17 @@ Result run_paged(const Workload& w, int num_blocks, int block_size, const Schedu
   r.strategy = "paged";
   double util_sum = 0;
   long long resident_sum = 0, active_sum = 0;
+  long long idle_steps = 0;
   while (sch.has_work()) {
     StepInput step = sch.schedule();
-    if (step.empty()) break;
+    if (step.empty()) {
+      // An empty step is not end of work: the scheduler may have just rejected
+      // an impossible request, or be waiting for memory. Bail only if it stops
+      // making progress, so a real stall still shows up instead of hanging.
+      if (++idle_steps > 1000) { std::fprintf(stderr, "scheduler stalled with work pending\n"); break; }
+      continue;
+    }
+    idle_steps = 0;
     // Occupancy is sampled after scheduling, before the tokens are appended:
     // that is the moment the cache is holding everything the step needs.
     long long allocated = 0, used = 0;
@@ -188,6 +201,71 @@ Result run_contiguous(const Workload& w, long long total_slots, bool reserve_max
   return r;
 }
 
+// Head-of-line blocking: with strict FCFS a large prompt that does not fit holds
+// up every smaller request behind it. This reports how long requests waited,
+// split by prompt size, for a given lookahead.
+void queueing_experiment(const Workload& w, int blocks, int block_size, SchedulerConfig cfg) {
+  std::printf("\nqueueing delay by prompt size (%d blocks = %d slots, max_num_seqs %d)\n",
+              blocks, blocks * block_size, cfg.max_num_seqs);
+  std::printf("| %9s | %8s | %10s | %10s | %9s | %8s | %11s |\n",
+              "lookahead", "prompt", "mean wait", "p95 wait", "max wait", "preempt", "wasted work");
+  std::printf("|%s|%s|%s|%s|%s|%s|%s|\n", std::string(11, '-').c_str(), std::string(10, '-').c_str(),
+              std::string(12, '-').c_str(), std::string(12, '-').c_str(), std::string(11, '-').c_str(),
+              std::string(10, '-').c_str(), std::string(13, '-').c_str());
+
+  for (int lookahead : {1, 4, 16}) {
+    cfg.admission_lookahead = lookahead;
+    KVCacheManager kv(blocks, block_size, false);
+    Scheduler sch(cfg, kv);
+    std::mt19937_64 rng(99);
+    std::vector<SequencePtr> seqs;
+    for (size_t i = 0; i < w.prompt_len.size(); i++) {
+      auto s = std::make_shared<Sequence>();
+      s->id = i + 1;
+      s->tokens.resize(w.prompt_len[i]);
+      for (auto& t : s->tokens) t = static_cast<int32_t>(rng() & 0x7fff);
+      s->prompt_len = s->num_tokens();
+      s->params.max_tokens = w.output_len[i];
+      s->params.ignore_eos = true;
+      sch.add(s);
+      seqs.push_back(s);
+    }
+    long long preemptions = 0, useful = 0;
+    for (size_t k = 0; k < w.prompt_len.size(); k++) useful += w.prompt_len[k] + w.output_len[k];
+    long long idle = 0;
+    while (sch.has_work()) {
+      StepInput step = sch.schedule();
+      if (step.empty()) { if (++idle > 1000) break; continue; }
+      idle = 0;
+      sch.on_step_done(step, std::vector<int32_t>(step.num_logits, 42));
+    }
+    preemptions = static_cast<long long>(sch.stats().preemptions);
+    // A request that was rejected as impossible would silently distort these
+    // numbers, so require that every one of them actually ran to completion.
+    for (const auto& s : seqs)
+      if (s->finish != FinishReason::Length) {
+        std::fprintf(stderr, "queueing experiment: request %llu ended as %s, not length\n",
+                     (unsigned long long)s->id, finish_reason_str(s->finish));
+        std::exit(1);
+      }
+
+    // Bucket by prompt length: 128 is "small", 1024 is "large".
+    for (int bucket : {64, 96, 128, 512, 1024, 2048}) {
+      std::vector<int> waits;
+      for (size_t i = 0; i < seqs.size(); i++)
+        if (w.prompt_len[i] == bucket) waits.push_back(seqs[i]->wait_steps);
+      if (waits.empty()) continue;
+      std::sort(waits.begin(), waits.end());
+      const double mean = std::accumulate(waits.begin(), waits.end(), 0.0) / waits.size();
+      const int p95 = waits[std::min(waits.size() - 1, static_cast<size_t>(0.95 * waits.size()))];
+      const double wasted = static_cast<double>(sch.stats().recomputed_tokens) /
+                            static_cast<double>(sch.stats().recomputed_tokens + useful);
+      std::printf("| %9d | %8d | %10.1f | %10d | %9d | %8lld | %10.1f%% |\n",
+                  lookahead, bucket, mean, p95, waits.back(), preemptions, 100.0 * wasted);
+    }
+  }
+}
+
 void print_row(const Result& r) {
   std::printf("| %-42s | %9.1f%% | %9.1f%% | %8.1f | %10.1f | %6d | %7lld |\n",
               r.strategy.c_str(), 100.0 * r.slot_utilization, 100.0 * (1.0 - r.slot_utilization),
@@ -239,7 +317,7 @@ void emit_json(const std::string& path, const std::vector<Result>& rs, const Wor
 
 int main(int argc, char** argv) {
   int requests = 512, blocks = 4096, block_size = 16, output_len = 128, max_num_seqs = 64;
-  bool fixed_output = false, sweep = false;
+  bool fixed_output = false, sweep = false, queueing = false, hol = false;
   std::string json_out = "bench/results/kv-waste.json";
   for (int i = 1; i < argc; i++) {
     auto val = [&] { return std::atoi(argv[++i]); };
@@ -250,11 +328,13 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--max-num-seqs")) max_num_seqs = val();
     else if (!std::strcmp(argv[i], "--fixed-output")) fixed_output = true;
     else if (!std::strcmp(argv[i], "--sweep")) sweep = true;
+    else if (!std::strcmp(argv[i], "--queueing")) queueing = true;
+    else if (!std::strcmp(argv[i], "--hol")) { hol = true; queueing = true; }
     else if (!std::strcmp(argv[i], "--json")) json_out = argv[++i];
     else { std::fprintf(stderr, "unknown flag %s\n", argv[i]); return 2; }
   }
 
-  const Workload w = make_workload(requests, output_len, fixed_output, 7);
+  const Workload w = make_workload(requests, output_len, fixed_output, 7, hol);
   const long long slots = static_cast<long long>(blocks) * block_size;
   const double mean_prompt = std::accumulate(w.prompt_len.begin(), w.prompt_len.end(), 0.0) / requests;
   const double mean_out = std::accumulate(w.output_len.begin(), w.output_len.end(), 0.0) / requests;
@@ -308,6 +388,7 @@ int main(int argc, char** argv) {
               " %.1f contiguous+continuous\n", best.mean_active, rs[3].mean_active,
               best.mean_active / std::max(rs[3].mean_active, 1e-9), fair.mean_active);
   if (sweep) sweep_pressure(w, block_size, cfg);
+  if (queueing) queueing_experiment(w, hol ? blocks / 4 : blocks / 8, block_size, cfg);
   emit_json(json_out, rs, w, slots, block_size);
   return 0;
 }

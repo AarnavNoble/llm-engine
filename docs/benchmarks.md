@@ -164,6 +164,41 @@ a 0.7% loss of occupancy in exchange for 6.5x fewer preemptions. At the tightest
 budget, where the engine is genuinely oversubscribed, preemption still happens —
 the watermark reduces thrash, it cannot create memory that is not there.
 
+**Queueing: strict FCFS versus bounded lookahead.** Admission serves the head
+of the queue, so a large prompt that does not fit holds up smaller requests
+behind it. `SchedulerConfig::admission_lookahead` lets the scheduler look that
+many positions down the queue for something admissible, and
+`starvation_wait_steps` bounds the unfairness: a request that has waited that
+many rounds cannot be overtaken, so it blocks the queue until it fits.
+
+Adversarial workload for FCFS — 192 requests, 90% of prompts at 64-96 tokens and
+10% at 2,048, in a 4,096-slot pool, so a large prompt needs half the pool:
+
+| lookahead | mean wait (steps) | drain time | preemptions | wasted work |
+|---|---|---|---|---|
+| 1 (strict FCFS) | 1,937 | 3,128 | 10 | **1.9%** |
+| 4 | 1,653 | 2,890 | 24 | 8.5% |
+| 16 | 1,653 | 2,890 | 24 | 8.5% |
+
+Lookahead saturates at 4 positions and buys a 15% lower mean wait and a 7.6%
+shorter drain, but it quadruples recompute waste from 1.9% to 8.5%, because
+admitting more sequences into a tight pool is exactly what the watermark is
+trying to avoid. Those two roughly cancel, so **strict FCFS stays the default**:
+it is simpler, its latency is predictable, and it burns less compute. The knob
+exists, is bounded, and is tested, but whether it pays depends on the relative
+cost of recompute against idle capacity, which is a GPU measurement.
+
+Large prompts do not starve under lookahead, which was the thing to check: at
+lookahead 4 they waited 1,494 steps against 1,653 for the small ones.
+
+Two bugs surfaced while building this experiment, and both had been hiding the
+real behaviour. The simulation loop treated an empty step as end of work, so it
+stopped at the first step where the scheduler admitted nothing and silently
+reported results for a fraction of the workload. And a request whose prompt plus
+`max_tokens` exceeds the whole KV pool was being admitted, generating one token,
+then aborted when it could not grow: `Engine::validate` now rejects it at
+submission with a 400 and an explanation, which is checked end to end.
+
 **A side effect worth recording.** On a backend that does not batch, continuous
 batching still changes *who waits*. Same workload, bimodal output lengths:
 
