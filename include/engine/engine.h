@@ -39,6 +39,10 @@ class Engine {
   void drain();    // stop accepting, finish in-flight, then stop (SIGTERM path)
 
   using TokenCallback = std::function<void(const Sequence&, int32_t token, FinishReason)>;
+  // Empty when the request can run; otherwise a client-facing reason why it
+  // never could, so the API can reject it instead of accepting work that is
+  // guaranteed to be aborted partway through.
+  std::string validate(size_t prompt_tokens, const SamplingParams& params) const;
   SequencePtr submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb);
   void abort(uint64_t id);
   bool accepting() const { return accepting_; }

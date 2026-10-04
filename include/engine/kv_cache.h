@@ -45,6 +45,8 @@ class KVCacheManager {
 
   int block_size() const { return block_size_; }
   int num_total_blocks() const { return num_blocks_; }
+  // Most tokens any single sequence could ever hold, if it owned the whole pool.
+  int capacity_tokens() const { return num_blocks_ * block_size_; }
   int num_free_blocks() const { return static_cast<int>(free_.size()); }
   int num_cached_blocks() const { return static_cast<int>(lru_.size()); }  // evictable, refcount 0
   int num_available_blocks() const { return num_free_blocks() + num_cached_blocks(); }

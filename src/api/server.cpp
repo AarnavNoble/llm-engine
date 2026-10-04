@@ -103,6 +103,7 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
       }
     } catch (const std::exception& e) { write_error(res, 400, e.what()); return; }
     if (prompt.empty()) { write_error(res, 400, "empty prompt"); return; }
+
     const bool stream = body.value("stream", false);
     const std::string id = now_id(chat ? "chatcmpl" : "cmpl");
     const std::string model = body.value("model", engine_.engine_config().model_dir);
@@ -110,6 +111,10 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
 
     auto ch = std::make_shared<Stream>();
     SamplingParams params = parse_params(body);
+    if (std::string why = engine_.validate(prompt.size(), params); !why.empty()) {
+      write_error(res, 400, why);
+      return;
+    }
     SequencePtr seq = engine_.submit(prompt, params, [ch](const Sequence&, int32_t t, FinishReason r) { ch->push(t, r); });
     if (!seq) { write_error(res, 503, "server is draining"); return; }
     const size_t prompt_tokens = prompt.size();

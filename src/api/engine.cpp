@@ -44,6 +44,27 @@ void Engine::drain() {
   running_ = false;
 }
 
+std::string Engine::validate(size_t prompt_tokens, const SamplingParams& params) const {
+  if (prompt_tokens == 0) return "prompt is empty";
+  if (params.max_tokens <= 0) return "max_tokens must be positive";
+  // A sequence needs room for its prompt and everything it will generate. If
+  // that exceeds the whole KV pool it can never finish, even alone: it would be
+  // admitted, generate a token, hit the end of the pool and be aborted.
+  const size_t need = prompt_tokens + static_cast<size_t>(params.max_tokens);
+  const size_t capacity = static_cast<size_t>(kv_.capacity_tokens());
+  if (need > capacity) {
+    return "prompt (" + std::to_string(prompt_tokens) + " tokens) plus max_tokens (" +
+           std::to_string(params.max_tokens) + ") exceeds the KV cache capacity of " +
+           std::to_string(capacity) + " tokens; raise --num-blocks or shorten the request";
+  }
+  const size_t model_max = static_cast<size_t>(model_->config().max_position_embeddings);
+  if (need > model_max) {
+    return "prompt plus max_tokens (" + std::to_string(need) + ") exceeds the model's context length of " +
+           std::to_string(model_max) + " tokens";
+  }
+  return "";
+}
+
 SequencePtr Engine::submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb) {
   if (!accepting_) return nullptr;
   auto s = std::make_shared<Sequence>();

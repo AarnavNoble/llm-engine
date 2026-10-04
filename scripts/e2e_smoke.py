@@ -156,6 +156,13 @@ def main(a):
         except urllib.error.HTTPError as e:
             code = e.code
         check("malformed JSON is rejected with 400", code == 400, str(code))
+        # A request that cannot fit the KV pool must be refused up front rather
+        # than admitted, generating a token and then aborted mid-stream.
+        huge = {"prompt_token_ids": list(range(1000, 1000 + 64)), "max_tokens": 10 ** 6}
+        check("a request larger than the KV cache is rejected with 400",
+              post_status(base + "/v1/completions", huge) == 400)
+        check("max_tokens of zero is rejected with 400",
+              post_status(base + "/v1/completions", {"prompt": "hi", "max_tokens": 0}) == 400)
 
         print("\nmetrics")
         status, metrics = get(base + "/metrics")
