@@ -24,7 +24,15 @@ struct SchedulerConfig {
   int max_num_seqs = 32;             // running sequences per step
   int max_num_batched_tokens = 2048; // prefill + decode tokens per step
   int prefill_chunk_size = 512;      // chunked prefill; long prompts are split
-  int starvation_wait_steps = 64;    // waiting this many rounds gets priority
+  // Admission is first-come-first-served, so a request at the head of the queue
+  // that does not fit holds up everything behind it, including requests that
+  // would fit. admission_lookahead > 1 lets the scheduler look that many
+  // positions down the queue for something admissible. starvation_wait_steps
+  // bounds the resulting unfairness: a request that has waited this many
+  // scheduling rounds may not be overtaken, so it blocks the queue until it
+  // fits. Lookahead 0 or 1 is strict FCFS and the bound never applies.
+  int admission_lookahead = 1;
+  int starvation_wait_steps = 64;
   // Admission watermark: free blocks that must remain after admitting a new
   // sequence. The engine admits optimistically and preempts reactively, so
   // without headroom a fresh admission steals the block a resident sequence
@@ -40,6 +48,7 @@ struct SchedulerStats {
   // be computed again. This is the price of recompute-on-resume, and without it
   // the preemption counter says how often it happened but not what it cost.
   uint64_t recomputed_tokens = 0;
+  uint64_t max_wait_steps = 0;   // worst scheduling rounds any request spent queued
 };
 
 class Scheduler {

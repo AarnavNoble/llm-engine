@@ -43,25 +43,35 @@ void Scheduler::add_prefill_slice(StepInput& step, Sequence& s, int len) {
 bool Scheduler::admit_one(StepInput& step, int& budget) {
   if (waiting_.empty() || budget <= 0) return false;
   if (static_cast<int>(running_.size()) >= cfg_.max_num_seqs) return false;
-  SequencePtr s = waiting_.front();
 
-  if (s->block_table.empty()) {
-    if (!admission_fits(*s)) return false;
-    auto cached = kv_.allocate_prompt(s->block_table, s->tokens);
-    if (!cached) return false;
-    s->num_computed = std::min(*cached, s->num_tokens() - 1);  // always compute >= 1 token so we get logits
-    if (s->t_first_scheduled == Clock::time_point{}) s->t_first_scheduled = Clock::now();
+  const size_t limit = cfg_.admission_lookahead <= 1
+                           ? 1
+                           : std::min(waiting_.size(), static_cast<size_t>(cfg_.admission_lookahead));
+  for (size_t i = 0; i < limit; i++) {
+    SequencePtr s = waiting_[i];
+    if (s->block_table.empty()) {
+      // Not admissible this step? A request that has waited too long must not be
+      // overtaken, so it holds the queue until it fits.
+      const bool starving = s->wait_steps >= cfg_.starvation_wait_steps;
+      if (!admission_fits(*s)) { if (starving) break; continue; }
+      auto cached = kv_.allocate_prompt(s->block_table, s->tokens);
+      if (!cached) { if (starving) break; continue; }
+      s->num_computed = std::min(*cached, s->num_tokens() - 1);
+      if (s->t_first_scheduled == Clock::time_point{}) s->t_first_scheduled = Clock::now();
+    }
+    const int remaining = s->num_tokens() - s->num_computed;
+    const int len = std::min({remaining, budget, cfg_.prefill_chunk_size});
+    if (len <= 0) return false;
+    add_prefill_slice(step, *s, len);
+    budget -= len;
+    waiting_.erase(waiting_.begin() + static_cast<long>(i));
+    running_.push_back(s);
+    s->status = SeqStatus::Running;
+    stats_.admitted++;
+    stats_.max_wait_steps = std::max(stats_.max_wait_steps, static_cast<uint64_t>(s->wait_steps));
+    return true;
   }
-  int remaining = s->num_tokens() - s->num_computed;
-  int len = std::min({remaining, budget, cfg_.prefill_chunk_size});
-  if (len <= 0) return false;
-  add_prefill_slice(step, *s, len);
-  budget -= len;
-  waiting_.pop_front();
-  running_.push_back(s);
-  s->status = SeqStatus::Running;
-  stats_.admitted++;
-  return true;
+  return false;
 }
 
 // Would admitting `s` leave enough free blocks for the resident sequences to

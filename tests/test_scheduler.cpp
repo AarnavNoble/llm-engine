@@ -401,3 +401,84 @@ TEST_CASE("scheduler: a reusable prefix does not count against the watermark") {
   drive(sch, m);
   REQUIRE(b->is_finished());
 }
+
+TEST_CASE("scheduler: lookahead admits a smaller request when the head does not fit") {
+  // 8 blocks of 16. The head needs 6 blocks and cannot be admitted alongside the
+  // resident sequence; the 1-block request behind it can.
+  KVCacheManager kv(8, 16, false);
+  SchedulerConfig cfg;
+  cfg.max_num_batched_tokens = 512;
+  cfg.admission_lookahead = 4;
+  Scheduler sch(cfg, kv);
+  auto resident = make_seq(1, 32, 8);   // 2 blocks
+  sch.add(resident);
+  FakeModel m;
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));
+  REQUIRE(sch.num_running() == 1);
+
+  auto big = make_seq(2, 96, 4);        // 6 blocks: leaves no headroom
+  auto small = make_seq(3, 8, 4);       // 1 block
+  sch.add(big); sch.add(small);
+  st = sch.schedule();
+  REQUIRE(sch.num_running() == 2);
+  bool small_admitted = false, big_admitted = false;
+  for (auto& sl : st.slices) {
+    if (sl.seq == small.get()) small_admitted = true;
+    if (sl.seq == big.get()) big_admitted = true;
+  }
+  REQUIRE(small_admitted);
+  REQUIRE_FALSE(big_admitted);
+  REQUIRE(sch.num_waiting() == 1);
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  REQUIRE(big->is_finished());          // and the head still gets served eventually
+  REQUIRE(small->is_finished());
+  REQUIRE(kv.num_used_blocks() == 0);
+}
+
+TEST_CASE("scheduler: strict FCFS is the default and does not reorder") {
+  KVCacheManager kv(8, 16, false);
+  SchedulerConfig cfg; cfg.max_num_batched_tokens = 512;   // admission_lookahead = 1
+  Scheduler sch(cfg, kv);
+  auto resident = make_seq(1, 32, 8);
+  sch.add(resident);
+  FakeModel m;
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));
+  auto big = make_seq(2, 96, 4), small = make_seq(3, 8, 4);
+  sch.add(big); sch.add(small);
+  st = sch.schedule();
+  REQUIRE(sch.num_running() == 1);       // head blocks the queue; small waits behind it
+  REQUIRE(sch.num_waiting() == 2);
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  for (auto& s : {resident, big, small}) REQUIRE(s->is_finished());
+}
+
+TEST_CASE("scheduler: a long-waiting request may not be overtaken") {
+  KVCacheManager kv(8, 16, false);
+  SchedulerConfig cfg;
+  cfg.max_num_batched_tokens = 512;
+  cfg.admission_lookahead = 8;
+  cfg.starvation_wait_steps = 3;         // small bound so the test is short
+  Scheduler sch(cfg, kv);
+  auto resident = make_seq(1, 32, 40);   // stays resident for the whole test
+  sch.add(resident);
+  FakeModel m;
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));
+
+  auto big = make_seq(2, 96, 4);         // never fits while resident holds blocks
+  sch.add(big);
+  for (int i = 0; i < 3; i++) { st = sch.schedule(); sch.on_step_done(st, m.run(st)); }
+  REQUIRE(big->wait_steps >= 3);
+
+  // A small request arriving now must not jump the starving head.
+  auto small = make_seq(3, 8, 4);
+  sch.add(small);
+  st = sch.schedule();
+  for (auto& sl : st.slices) REQUIRE(sl.seq != small.get());
+  REQUIRE(sch.num_waiting() == 2);
+  sch.on_step_done(st, m.run(st));
+  drive(sch, m);
+  for (auto& s : {resident, big, small}) REQUIRE(s->is_finished());
+  REQUIRE(kv.num_used_blocks() == 0);
+}
