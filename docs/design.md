@@ -49,8 +49,27 @@ Sharing only ever involves full blocks, so copy-on-write is never needed: a sequ
 - GQA: query head `h` reads KV head `h / (num_heads / num_kv_heads)`.
 - Qwen2 has q/k/v bias; Llama does not. Loader treats each bias as optional.
 
+## Architecture genericity
+
+Every dimension comes from `config.json`, and that claim is tested rather than
+asserted: the per-layer numerical comparison runs against both Qwen2.5-0.5B
+(qwen2: q/k/v bias, tied embeddings, GQA 7, eps 1e-6, theta 1e6) and
+TinyLlama-1.1B (llama: no bias, untied `lm_head`, GQA 8, eps 1e-5, theta 1e4).
+TinyLlama was the first exercise of the untied-head path, and it passed
+unmodified.
+
+Not yet generic: the tokenizer reads byte-level BPE from `tokenizer.json` and
+does not implement sentencepiece, so TinyLlama's text cannot be tokenized in
+C++. The correctness tests feed token ids directly, which is why that gap does
+not block verifying its forward pass.
+
 ## Lessons recorded
 
+- A missing test fixture must not read as a pass. The per-layer dumps are
+  gitignored and regenerable, and the test originally `WARN`ed when they were
+  absent, so after they were deleted the suite kept reporting green while the
+  central correctness check silently did nothing. It now `SKIP`s, which is
+  visible in the output.
 - Reference dumps must control every `generation_config.json` knob: Qwen ships `repetition_penalty=1.1`, which `generate()` applies even under greedy decoding, and without an explicit `attention_mask` positions equal to `pad_token_id` are masked — chat prompts contain `<|im_end|>`.
 
 ## Not built (say so in interviews)

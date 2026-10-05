@@ -2,8 +2,8 @@
 """Ground truth for the numerical tests.
 
 Runs the HF model in fp32 on a fixed prompt set and writes
-  tests/data/prompts.json            (committed)  ids, per-position argmax, greedy continuation
-  tests/data/ref/<i>.bin             (gitignored) residual stream after embedding and after every
+  tests/data/<model>/prompts.json    (committed)  ids, per-position argmax, greedy continuation
+  tests/data/<model>/ref/<i>.bin     (gitignored) residual stream after embedding and after every
                                                   layer, plus the last-token logits, all fp32
 Layout of each .bin: int32 n_tokens, n_layers, hidden, vocab; then
   float32 resid[n_layers+1][n_tokens][hidden]; float32 logits[vocab].
@@ -13,7 +13,11 @@ import numpy as np, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_dir = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen2.5-0.5B-Instruct"
-out_dir = pathlib.Path("tests/data"); (out_dir / "ref").mkdir(parents=True, exist_ok=True)
+# Each model gets its own data directory, so a second architecture can be
+# verified without disturbing the first one's committed expectations.
+name = pathlib.Path(model_dir.rstrip("/")).name
+out_dir = pathlib.Path("tests/data") / name
+(out_dir / "ref").mkdir(parents=True, exist_ok=True)
 torch.manual_seed(0)
 tok = AutoTokenizer.from_pretrained(model_dir)
 model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32).eval()
@@ -27,8 +31,11 @@ texts = [
     "Q: What is 17 * 23?\nA:", "Roses are red, violets are blue,", "The mitochondria is the",
     "CUDA kernels are launched with a grid of", "She opened the door and saw", "In conclusion,",
 ]
-chats = [[{"role": "user", "content": "What is paged attention? Answer in one sentence."}],
-         [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Name three GPU vendors."}]]
+# Chat cases only where the C++ side implements the template (ChatML today).
+chats = []
+if "qwen" in name.lower():
+    chats = [[{"role": "user", "content": "What is paged attention? Answer in one sentence."}],
+             [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Name three GPU vendors."}]]
 prompts = [{"text": t, "ids": tok.encode(t, add_special_tokens=False)} for t in texts]
 for c in chats:
     r = tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True)
