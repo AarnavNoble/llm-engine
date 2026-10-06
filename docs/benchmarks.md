@@ -49,18 +49,49 @@ batching burns on finished sequences that still hold their blocks.
 Paged waste tracks half a block per sequence, as expected: 0.5% at block size
 8, 1.1% at 16, 2.3% at 32.
 
-**Throughput: needs the GPU, and here is why.** `CpuModel::forward` loops over
-the step's slices and runs a separate forward pass for each one. Nothing is
-batched, so the total work for N tokens is the same however those tokens are
-scheduled, and tokens/s is by construction independent of the scheduler.
-Measured on the Mac at 16 concurrent requests, static and continuous batching
-both produced 12.58 tokens/s — identical to three significant figures, exactly
-as the implementation predicts.
+**Throughput: now measurable on CPU too, after the forward pass was batched.**
+This section previously said throughput could not be measured here, and the
+reason was an implementation detail rather than a law: `CpuModel::forward` ran a
+separate forward pass per slice, so the work for N tokens was identical however
+they were scheduled and tokens/s was scheduler-independent by construction.
+Both modes measured 12.58 tokens/s, to three significant figures.
 
-Continuous batching's throughput win comes from amortizing weight reads across
-a batched GEMM. That only exists on the CUDA backend, so the throughput rows of
-the table stay empty until the kernels are written. Publishing a CPU tokens/s
-comparison as evidence for continuous batching would be meaningless.
+The forward pass now packs every slice in the step into one `[N, hidden]` batch,
+so each layer runs one GEMM per projection instead of one per sequence.
+Attention stays a loop over (token, head), because each token attends over its
+own sequence's block table for its own length. That is the same packing the CUDA
+backend needs, so this also rehearses the layout.
+
+Throughput now scales with the batch, as it should:
+
+| concurrent requests | tokens/s |
+|---|---|
+| 1 | 25.6 |
+| 4 | 45.5 |
+| 16 | 152.2 |
+
+And the continuous-batching comparison finally says something. 48 requests,
+bimodal output lengths, 16 concurrent, through the HTTP server:
+
+| | static batching | continuous batching | change |
+|---|---|---|---|
+| tokens/s | 38.9 | 57.1 | **1.47x** |
+| wall clock | 35.1 s | 24.0 s | 1.47x faster |
+| TTFT p50 | 13,673 ms | 2,330 ms | **5.9x faster** |
+
+The TTFT gap is the larger one and the easier to explain: under static batching a
+new request cannot start until the entire current batch drains, so its first
+token waits behind the longest generation in flight.
+
+These are CPU numbers on a 0.5B model and they are not a prediction of GPU
+throughput, where the arithmetic intensity of a batched GEMM is the whole point
+and the gain should be larger. They do establish that the scheduler earns its
+complexity, which could not be shown before.
+
+Packing correctness is tested, not assumed: a sequence's logits must not depend
+on who else is in the step. Two tests cover it, one comparing three sequences
+packed together against each run alone, and one checking a mid-generation decode
+token packed beside someone else's prefill chunk.
 
 **Prefix caching: measurable on CPU, because it removes work.** A cache hit
 skips prefill for the shared blocks outright, so the saving is arithmetic

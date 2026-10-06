@@ -97,20 +97,122 @@ class CpuModel final : public Model {
   const ModelConfig& config() const override { return cfg_; }
   const char* backend() const override { return "cpu"; }
 
+  // Every slice in the step is packed into one [N, hidden] batch, so each layer
+  // runs one GEMM per projection instead of one per sequence. Attention cannot be
+  // batched the same way, because each token attends over its own sequence's
+  // block table for its own length, so it stays a loop over (token, head). This
+  // is the same packing the CUDA backend needs.
   void forward(const StepInput& step, std::vector<float>& logits) override {
-    logits.resize(static_cast<size_t>(step.num_logits) * cfg_.vocab_size);
-    int row = 0;
+    logits.assign(static_cast<size_t>(step.num_logits) * cfg_.vocab_size, 0.f);
+    if (step.slices.empty()) return;
+
+    const int H = cfg_.hidden_size, hd = cfg_.head_dim, nh = cfg_.num_attention_heads,
+              nkv = cfg_.num_key_value_heads, I = cfg_.intermediate_size,
+              group = cfg_.gqa_group(), bs = kv_.block_size();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    // Flatten the step: one entry per token, in slice order.
+    tok_seq_.clear(); tok_pos_.clear(); tok_id_.clear(); logit_rows_.clear();
     for (const auto& sl : step.slices) {
-      forward_slice(sl, sl.needs_logits ? logits.data() + static_cast<size_t>(row) * cfg_.vocab_size : nullptr);
-      if (sl.needs_logits) row++;
+      for (int t = 0; t < sl.len; t++) {
+        tok_seq_.push_back(sl.seq);
+        tok_pos_.push_back(sl.start + t);
+        tok_id_.push_back(sl.seq->tokens[sl.start + t]);
+      }
+      // Only the last token of a slice that wants logits produces a row.
+      if (sl.needs_logits) logit_rows_.push_back(static_cast<int>(tok_id_.size()) - 1);
     }
+    const int N = static_cast<int>(tok_id_.size());
+
+    x_.assign(static_cast<size_t>(N) * H, 0.f);
+    for (int i = 0; i < N; i++)
+      std::memcpy(x_.data() + static_cast<size_t>(i) * H,
+                  embed_.ptr() + static_cast<size_t>(tok_id_[i]) * H, sizeof(float) * H);
+    if (opts_.on_layer) opts_.on_layer(-1, x_.data(), N);
+
+    h_.resize(static_cast<size_t>(N) * H); q_.resize(static_cast<size_t>(N) * H);
+    k_.resize(static_cast<size_t>(N) * kv_dim_); v_.resize(static_cast<size_t>(N) * kv_dim_);
+    attn_.resize(static_cast<size_t>(N) * H); o_.resize(static_cast<size_t>(N) * H);
+    gate_.resize(static_cast<size_t>(N) * I); up_.resize(static_cast<size_t>(N) * I);
+
+    for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+      const Layer& L = layers_[l];
+      float* kc = k_cache_[l].data();
+      float* vc = v_cache_[l].data();
+
+      rmsnorm(x_.data(), L.in_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      linear(h_.data(), N, H, L.wq.ptr(), H, L.bq.numel() ? L.bq.ptr() : nullptr, q_.data());
+      linear(h_.data(), N, H, L.wk.ptr(), kv_dim_, L.bk.numel() ? L.bk.ptr() : nullptr, k_.data());
+      linear(h_.data(), N, H, L.wv.ptr(), kv_dim_, L.bv.numel() ? L.bv.ptr() : nullptr, v_.data());
+
+      // Rotate and write K/V for every token first, so tokens that arrived in
+      // this same step can attend to each other.
+      for (int i = 0; i < N; i++) {
+        const int pos = tok_pos_[i];
+        apply_rope(q_.data() + static_cast<size_t>(i) * H, nh, pos);
+        apply_rope(k_.data() + static_cast<size_t>(i) * kv_dim_, nkv, pos);
+        const int64_t slot = tok_seq_[i]->block_table.slot(pos, bs);
+        std::memcpy(kc + static_cast<size_t>(slot) * kv_dim_,
+                    k_.data() + static_cast<size_t>(i) * kv_dim_, sizeof(float) * kv_dim_);
+        std::memcpy(vc + static_cast<size_t>(slot) * kv_dim_,
+                    v_.data() + static_cast<size_t>(i) * kv_dim_, sizeof(float) * kv_dim_);
+      }
+
+      for (int i = 0; i < N; i++) {
+        const int pos = tok_pos_[i];
+        const BlockTable& bt = tok_seq_[i]->block_table;
+        scores_.resize(static_cast<size_t>(pos) + 1);
+        for (int h = 0; h < nh; h++) {
+          const int kvh = h / group;
+          const float* q = q_.data() + static_cast<size_t>(i) * H + h * hd;
+          float mx = -INFINITY;
+          for (int p = 0; p <= pos; p++) {
+            const float* k = kc + static_cast<size_t>(bt.slot(p, bs)) * kv_dim_ + kvh * hd;
+            float sc = 0.f;
+            for (int d = 0; d < hd; d++) sc += q[d] * k[d];
+            sc *= scale; scores_[p] = sc; if (sc > mx) mx = sc;
+          }
+          double denom = 0;
+          for (int p = 0; p <= pos; p++) { scores_[p] = std::exp(scores_[p] - mx); denom += scores_[p]; }
+          float* out = attn_.data() + static_cast<size_t>(i) * H + h * hd;
+          for (int d = 0; d < hd; d++) out[d] = 0.f;
+          for (int p = 0; p <= pos; p++) {
+            const float wgt = static_cast<float>(scores_[p] / denom);
+            const float* vv = vc + static_cast<size_t>(bt.slot(p, bs)) * kv_dim_ + kvh * hd;
+            for (int d = 0; d < hd; d++) out[d] += wgt * vv[d];
+          }
+        }
+      }
+
+      linear(attn_.data(), N, H, L.wo.ptr(), H, nullptr, o_.data());
+      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
+
+      rmsnorm(x_.data(), L.post_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      linear(h_.data(), N, H, L.wgate.ptr(), I, nullptr, gate_.data());
+      linear(h_.data(), N, H, L.wup.ptr(), I, nullptr, up_.data());
+      for (size_t i = 0; i < gate_.size(); i++) { float g = gate_[i]; gate_[i] = g / (1.0f + std::exp(-g)) * up_[i]; }
+      linear(gate_.data(), N, I, L.wdown.ptr(), H, nullptr, o_.data());
+      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
+      if (opts_.on_layer) opts_.on_layer(l, x_.data(), N);
+    }
+
+    if (logit_rows_.empty()) return;
+    // Gather only the rows that need logits, then one GEMM against the head.
+    const int R = static_cast<int>(logit_rows_.size());
+    h_.resize(static_cast<size_t>(R) * H);
+    for (int r = 0; r < R; r++)
+      rmsnorm(x_.data() + static_cast<size_t>(logit_rows_[r]) * H, final_norm_.ptr(),
+              h_.data() + static_cast<size_t>(r) * H, 1, H, cfg_.rms_norm_eps);
+    const Tensor& head = cfg_.tie_word_embeddings ? embed_ : lm_head_;
+    linear(h_.data(), R, H, head.ptr(), cfg_.vocab_size, nullptr, logits.data());
   }
 
  private:
   // RoPE in the HF "rotate_half" convention: pairs (i, i + half).
   void apply_rope(float* x, int heads, int pos) const {
     const int hd = cfg_.head_dim, half = hd / 2;
-    const float* c = cos_.data() + static_cast<size_t>(pos) * half; const float* s = sin_.data() + static_cast<size_t>(pos) * half;
+    const float* c = cos_.data() + static_cast<size_t>(pos) * half;
+    const float* s = sin_.data() + static_cast<size_t>(pos) * half;
     for (int h = 0; h < heads; h++) {
       float* v = x + h * hd;
       for (int i = 0; i < half; i++) {
@@ -121,81 +223,6 @@ class CpuModel final : public Model {
     }
   }
 
-  void forward_slice(const StepSlice& sl, float* logits_out) {
-    const Sequence& seq = *sl.seq;
-    const int T = sl.len, H = cfg_.hidden_size, hd = cfg_.head_dim, nh = cfg_.num_attention_heads,
-              nkv = cfg_.num_key_value_heads, I = cfg_.intermediate_size, group = cfg_.gqa_group(), bs = kv_.block_size();
-    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-
-    x_.assign(static_cast<size_t>(T) * H, 0.f);
-    for (int t = 0; t < T; t++)
-      std::memcpy(x_.data() + static_cast<size_t>(t) * H, embed_.ptr() + static_cast<size_t>(seq.tokens[sl.start + t]) * H, sizeof(float) * H);
-    if (opts_.on_layer) opts_.on_layer(-1, x_.data(), T);
-
-    h_.resize(static_cast<size_t>(T) * H); q_.resize(static_cast<size_t>(T) * H); k_.resize(static_cast<size_t>(T) * kv_dim_);
-    v_.resize(static_cast<size_t>(T) * kv_dim_); attn_.resize(static_cast<size_t>(T) * H); o_.resize(static_cast<size_t>(T) * H);
-    gate_.resize(static_cast<size_t>(T) * I); up_.resize(static_cast<size_t>(T) * I);
-    scores_.resize(static_cast<size_t>(sl.start + T));
-
-    for (int l = 0; l < cfg_.num_hidden_layers; l++) {
-      const Layer& L = layers_[l];
-      float* kc = k_cache_[l].data(); float* vc = v_cache_[l].data();
-
-      // --- attention block ---
-      rmsnorm(x_.data(), L.in_norm.ptr(), h_.data(), T, H, cfg_.rms_norm_eps);
-      linear(h_.data(), T, H, L.wq.ptr(), H, L.bq.numel() ? L.bq.ptr() : nullptr, q_.data());
-      linear(h_.data(), T, H, L.wk.ptr(), kv_dim_, L.bk.numel() ? L.bk.ptr() : nullptr, k_.data());
-      linear(h_.data(), T, H, L.wv.ptr(), kv_dim_, L.bv.numel() ? L.bv.ptr() : nullptr, v_.data());
-      for (int t = 0; t < T; t++) {
-        const int pos = sl.start + t;
-        apply_rope(q_.data() + static_cast<size_t>(t) * H, nh, pos);
-        apply_rope(k_.data() + static_cast<size_t>(t) * kv_dim_, nkv, pos);
-        const int64_t slot = seq.block_table.slot(pos, bs);
-        std::memcpy(kc + static_cast<size_t>(slot) * kv_dim_, k_.data() + static_cast<size_t>(t) * kv_dim_, sizeof(float) * kv_dim_);
-        std::memcpy(vc + static_cast<size_t>(slot) * kv_dim_, v_.data() + static_cast<size_t>(t) * kv_dim_, sizeof(float) * kv_dim_);
-      }
-      // Causal attention over the paged cache, one (token, head) at a time.
-      for (int t = 0; t < T; t++) {
-        const int pos = sl.start + t;
-        for (int h = 0; h < nh; h++) {
-          const int kvh = h / group;
-          const float* q = q_.data() + static_cast<size_t>(t) * H + h * hd;
-          float mx = -INFINITY;
-          for (int p = 0; p <= pos; p++) {
-            const float* k = kc + static_cast<size_t>(seq.block_table.slot(p, bs)) * kv_dim_ + kvh * hd;
-            float s = 0.f; for (int d = 0; d < hd; d++) s += q[d] * k[d];
-            s *= scale; scores_[p] = s; if (s > mx) mx = s;
-          }
-          double denom = 0; for (int p = 0; p <= pos; p++) { scores_[p] = std::exp(scores_[p] - mx); denom += scores_[p]; }
-          float* out = attn_.data() + static_cast<size_t>(t) * H + h * hd;
-          for (int d = 0; d < hd; d++) out[d] = 0.f;
-          for (int p = 0; p <= pos; p++) {
-            const float w = static_cast<float>(scores_[p] / denom);
-            const float* v = vc + static_cast<size_t>(seq.block_table.slot(p, bs)) * kv_dim_ + kvh * hd;
-            for (int d = 0; d < hd; d++) out[d] += w * v[d];
-          }
-        }
-      }
-      linear(attn_.data(), T, H, L.wo.ptr(), H, nullptr, o_.data());
-      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
-
-      // --- MLP block: down(silu(gate(x)) * up(x)) ---
-      rmsnorm(x_.data(), L.post_norm.ptr(), h_.data(), T, H, cfg_.rms_norm_eps);
-      linear(h_.data(), T, H, L.wgate.ptr(), I, nullptr, gate_.data());
-      linear(h_.data(), T, H, L.wup.ptr(), I, nullptr, up_.data());
-      for (size_t i = 0; i < gate_.size(); i++) { float g = gate_[i]; gate_[i] = g / (1.0f + std::exp(-g)) * up_[i]; }
-      linear(gate_.data(), T, I, L.wdown.ptr(), H, nullptr, o_.data());
-      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
-      if (opts_.on_layer) opts_.on_layer(l, x_.data(), T);
-    }
-
-    if (!logits_out) return;
-    // Logits only for the last token of the slice.
-    rmsnorm(x_.data() + static_cast<size_t>(T - 1) * H, final_norm_.ptr(), h_.data(), 1, H, cfg_.rms_norm_eps);
-    const Tensor& head = cfg_.tie_word_embeddings ? embed_ : lm_head_;
-    linear(h_.data(), 1, H, head.ptr(), cfg_.vocab_size, nullptr, logits_out);
-  }
-
   ModelConfig cfg_;
   const KVCacheManager& kv_;
   CpuModelOptions opts_;
@@ -204,8 +231,12 @@ class CpuModel final : public Model {
   std::vector<float> cos_, sin_;
   int kv_dim_ = 0;
   std::vector<std::vector<float>> k_cache_, v_cache_;
-  // scratch
+  // scratch, reused across steps
   std::vector<float> x_, h_, q_, k_, v_, attn_, o_, gate_, up_, scores_;
+  std::vector<const Sequence*> tok_seq_;   // per packed token: owning sequence
+  std::vector<int> tok_pos_;               // per packed token: position in that sequence
+  std::vector<int32_t> tok_id_;            // per packed token: token id
+  std::vector<int> logit_rows_;            // packed indices whose logits are wanted
 };
 
 }  // namespace

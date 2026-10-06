@@ -156,3 +156,111 @@ TEST_CASE("cpu model: greedy generation through the scheduler matches HF generat
   }
   REQUIRE(F.kv.num_used_blocks() == 0);
 }
+
+TEST_CASE("cpu model: packing is batching-invariant", "[model][slow]") {
+  // The packed forward runs several sequences through one set of GEMMs. A token's
+  // logits must not depend on who else happens to be in the step; if they did,
+  // batching would silently change answers, which is the failure mode that
+  // matters most once the CUDA backend packs the same way.
+  Fixture& F = Fixture::primary();
+  auto P = load_prompts(F.data);
+  const int V = F.model->config().vocab_size;
+
+  std::vector<SequencePtr> seqs;
+  for (size_t i : {0u, 3u, 7u}) {
+    auto s = std::make_shared<Sequence>();
+    s->tokens = P["prompts"][i]["ids"].get<std::vector<int32_t>>();
+    s->prompt_len = s->num_tokens();
+    REQUIRE(F.kv.allocate_prompt(s->block_table, s->tokens).has_value());
+    seqs.push_back(s);
+  }
+
+  auto slice_for = [](Sequence* s) {
+    StepSlice sl; sl.seq = s; sl.start = 0; sl.len = s->num_tokens();
+    sl.needs_logits = true; sl.is_prefill = true; return sl;
+  };
+
+  // One step containing all three sequences.
+  StepInput together;
+  for (auto& s : seqs) {
+    together.slices.push_back(slice_for(s.get()));
+    together.num_prefill_tokens += s->num_tokens();
+    together.num_logits++;
+  }
+  std::vector<float> batched;
+  F.model->forward(together, batched);
+  REQUIRE(batched.size() == static_cast<size_t>(3) * V);
+
+  // The same sequences, one per step.
+  for (int i = 0; i < 3; i++) {
+    StepInput alone;
+    alone.slices.push_back(slice_for(seqs[i].get()));
+    alone.num_prefill_tokens = seqs[i]->num_tokens();
+    alone.num_logits = 1;
+    std::vector<float> single;
+    F.model->forward(alone, single);
+    REQUIRE(single.size() == static_cast<size_t>(V));
+    const float* row = batched.data() + static_cast<size_t>(i) * V;
+    float worst = 0;
+    for (int t = 0; t < V; t++) worst = std::max(worst, std::fabs(single[t] - row[t]));
+    INFO("sequence " << i << " max |batched - alone| = " << worst);
+    CHECK(worst < 1e-3f);
+    CHECK(Sampler::argmax(single.data(), V) == Sampler::argmax(row, V));
+  }
+  for (auto& s : seqs) F.kv.free(s->block_table);
+}
+
+TEST_CASE("cpu model: a decode token packed beside a prefill chunk is unaffected", "[model][slow]") {
+  // Mixed steps are the whole point of continuous batching, so check the case
+  // directly: a sequence mid-generation must produce the same next token whether
+  // or not someone else's prompt is being prefilled alongside it.
+  Fixture& F = Fixture::primary();
+  auto P = load_prompts(F.data);
+  const int V = F.model->config().vocab_size;
+
+  auto decoder = std::make_shared<Sequence>();
+  decoder->tokens = P["prompts"][1]["ids"].get<std::vector<int32_t>>();
+  decoder->prompt_len = decoder->num_tokens();
+  REQUIRE(F.kv.allocate_prompt(decoder->block_table, decoder->tokens).has_value());
+
+  // Prefill it, sample greedily, append, so it is genuinely mid-stream.
+  StepInput prefill;
+  StepSlice p; p.seq = decoder.get(); p.len = decoder->num_tokens(); p.needs_logits = true; p.is_prefill = true;
+  prefill.slices.push_back(p); prefill.num_prefill_tokens = p.len; prefill.num_logits = 1;
+  std::vector<float> lg;
+  F.model->forward(prefill, lg);
+  decoder->tokens.push_back(Sampler::argmax(lg.data(), V));
+  REQUIRE(F.kv.ensure_slot(decoder->block_table, decoder->num_tokens()));
+
+  auto decode_slice = [&] {
+    StepSlice d; d.seq = decoder.get(); d.start = decoder->num_tokens() - 1; d.len = 1; d.needs_logits = true;
+    return d;
+  };
+
+  StepInput alone;
+  alone.slices.push_back(decode_slice());
+  alone.num_decode_tokens = 1; alone.num_logits = 1;
+  std::vector<float> solo;
+  F.model->forward(alone, solo);
+
+  auto other = std::make_shared<Sequence>();
+  other->tokens = P["prompts"][5]["ids"].get<std::vector<int32_t>>();
+  other->prompt_len = other->num_tokens();
+  REQUIRE(F.kv.allocate_prompt(other->block_table, other->tokens).has_value());
+  StepInput mixed;
+  StepSlice op; op.seq = other.get(); op.len = other->num_tokens(); op.needs_logits = true; op.is_prefill = true;
+  mixed.slices.push_back(op);                 // prefill first, as the scheduler orders it
+  mixed.slices.push_back(decode_slice());
+  mixed.num_prefill_tokens = op.len; mixed.num_decode_tokens = 1; mixed.num_logits = 2;
+  std::vector<float> both;
+  F.model->forward(mixed, both);
+
+  const float* decode_row = both.data() + static_cast<size_t>(V);  // second logits row
+  float worst = 0;
+  for (int t = 0; t < V; t++) worst = std::max(worst, std::fabs(solo[t] - decode_row[t]));
+  INFO("max |mixed - alone| = " << worst);
+  CHECK(worst < 1e-3f);
+  CHECK(Sampler::argmax(solo.data(), V) == Sampler::argmax(decode_row, V));
+  F.kv.free(decoder->block_table);
+  F.kv.free(other->block_table);
+}
