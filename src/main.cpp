@@ -78,8 +78,8 @@ int cmd_generate(const Args& a) {
   const Tokenizer& tok = eng.tokenizer();
   std::vector<int32_t> prompt;
   if (!a.ids.empty()) { size_t p = 0; while (p < a.ids.size()) { size_t q = a.ids.find(',', p); if (q == std::string::npos) q = a.ids.size(); prompt.push_back(std::stoi(a.ids.substr(p, q - p))); p = q + 1; } }
-  else if (!a.chat.empty()) prompt = tok.encode(tok.apply_chat_template({{"user", a.chat}}));
-  else prompt = tok.encode(a.prompt);
+  else if (!a.chat.empty()) prompt = tok.encode_for_generation(tok.apply_chat_template({{"user", a.chat}}));
+  else prompt = tok.encode_for_generation(a.prompt);
 
   std::mutex mu; std::condition_variable cv; int done = 0;
   std::vector<std::string> outputs(a.copies);

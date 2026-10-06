@@ -58,10 +58,31 @@ TinyLlama-1.1B (llama: no bias, untied `lm_head`, GQA 8, eps 1e-5, theta 1e4).
 TinyLlama was the first exercise of the untied-head path, and it passed
 unmodified.
 
-Not yet generic: the tokenizer reads byte-level BPE from `tokenizer.json` and
-does not implement sentencepiece, so TinyLlama's text cannot be tokenized in
-C++. The correctness tests feed token ids directly, which is why that gap does
-not block verifying its forward pass.
+The tokenizer handles both BPE families that appear in `tokenizer.json`, chosen
+by what the file declares:
+
+- **ByteLevel** (GPT-2, Qwen): a regex pre-tokenizer splits the text, then every
+  byte maps to a printable placeholder character.
+- **Metaspace** (Llama, sentencepiece-derived): no pre-tokenizer at all. The
+  normaliser prepends U+2581 and replaces every space with it, BPE runs over
+  characters, and a character outside the vocabulary falls back to one `<0xNN>`
+  token per UTF-8 byte. Decoding reverses that and strips the one leading space
+  the normaliser added.
+
+Both reproduce Hugging Face exactly on the corpus. The merge loop is shared;
+merges are stored as `(left id, right id) -> (rank, merged id)` so neither path
+has to concatenate token strings to find the result, which matters because
+byte-fallback tokens do not concatenate meaningfully.
+
+Special tokens are a model property too: Llama's post-processor inserts `<s>`
+before every sequence and Qwen's does not, so `encode_for_generation` adds BOS
+only when the tokenizer declares it. Prompts submitted as raw `prompt_token_ids`
+skip this entirely, since the client controls those exactly.
+
+Still not generic: chat templates. Only ChatML is implemented, so
+`/v1/chat/completions` against TinyLlama returns 400 with
+"only ChatML chat templates are implemented" rather than silently using the
+wrong prompt format. `/v1/completions` works for both models.
 
 ## Lessons recorded
 

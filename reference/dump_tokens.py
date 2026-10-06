@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Write tests/data/tokens.jsonl: {text, ids} pairs from the HF tokenizer, the ground truth
-for the C++ tokenizer test. Includes chat-template rendering cases."""
+"""Write tests/data/<model>/tokens.jsonl: {text, ids} pairs from the HF tokenizer,
+the ground truth for the C++ tokenizer test. Chat-template cases are included
+only for models whose template the C++ side implements (ChatML)."""
 import json, sys, pathlib
 from transformers import AutoTokenizer
 
 model_dir = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen2.5-0.5B-Instruct"
-out = pathlib.Path("tests/data/tokens.jsonl")
+name = pathlib.Path(model_dir.rstrip("/")).name
+out = pathlib.Path("tests/data") / name / "tokens.jsonl"
 tok = AutoTokenizer.from_pretrained(model_dir)
 
 texts = [
@@ -29,8 +31,8 @@ texts.append(("Paged attention partitions the KV cache of each sequence into fix
 rows = []
 for t in texts:
     rows.append({"text": t, "ids": tok.encode(t, add_special_tokens=False)})
-# Chat template cases (no tools).
-convs = [
+# Chat template cases, ChatML only (no tools).
+convs = [] if "qwen" not in name.lower() else [
     [{"role": "user", "content": "What is paged attention?"}],
     [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Say hi."}],
     [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}],

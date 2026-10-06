@@ -94,12 +94,12 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
       if (chat) {
         std::vector<ChatMessage> msgs;
         for (const auto& m : body.at("messages")) msgs.push_back({m.at("role"), m.at("content")});
-        prompt = tok.encode(tok.apply_chat_template(msgs));
+        prompt = tok.encode_for_generation(tok.apply_chat_template(msgs));
       } else if (body.contains("prompt_token_ids")) {
         prompt = body["prompt_token_ids"].get<std::vector<int32_t>>();
       } else {
         const auto& p = body.at("prompt");
-        if (p.is_array()) prompt = p.get<std::vector<int32_t>>(); else prompt = tok.encode(p.get<std::string>());
+        if (p.is_array()) prompt = p.get<std::vector<int32_t>>(); else prompt = tok.encode_for_generation(p.get<std::string>());
       }
     } catch (const std::exception& e) { write_error(res, 400, e.what()); return; }
     if (prompt.empty()) { write_error(res, 400, "empty prompt"); return; }

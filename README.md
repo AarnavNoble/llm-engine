@@ -65,7 +65,7 @@ Deployment lives in [`deploy/`](deploy): a multi-stage Dockerfile with `gpu` and
 - final logits: max |diff| < 1e-2, argmax identical
 - 16-token greedy generation through the scheduler with 6 sequences batched together: identical to `generate()`
 
-The same comparison runs against a second architecture, **TinyLlama-1.1B**, which differs from Qwen in every way the loader could have hardcoded: no q/k/v bias, an untied `lm_head`, GQA ratio 8 instead of 7, `rms_norm_eps` 1e-5, `rope_theta` 10,000. It passes unchanged. Its tokenizer is sentencepiece, which the C++ side does not read yet, so those prompts are supplied as token ids.
+The same comparison runs against a second architecture, **TinyLlama-1.1B**, which differs from Qwen in every way the loader could have hardcoded: no q/k/v bias, an untied `lm_head`, GQA ratio 8 instead of 7, `rms_norm_eps` 1e-5, `rope_theta` 10,000. It passes unchanged. Its sentencepiece-style tokenizer is supported too, so the whole path works end to end: `engine generate --model models/TinyLlama-1.1B-Chat-v1.0 --prompt "The capital of France is"` reproduces Hugging Face's greedy continuation token for token. Chat templates are still ChatML-only, so `/v1/chat/completions` against TinyLlama returns 400 rather than guessing a format.
 
 The tokenizer is checked token-for-token against `tokenizers` on a 75-line corpus (CJK, emoji, contractions, whitespace runs, chat templates).
 

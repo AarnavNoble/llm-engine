@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <climits>
+#include <cstdio>
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
@@ -91,11 +92,35 @@ Tokenizer::Tokenizer(const std::string& model_dir) {
   int32_t rank = 0;
   for (const auto& m : merges) {
     std::string a, b;
-    if (m.is_string()) { std::string s = m.get<std::string>(); size_t sp = s.find(' '); a = s.substr(0, sp); b = s.substr(sp + 1); }
+    if (m.is_string()) { std::string t = m.get<std::string>(); size_t sp = t.find(' '); a = t.substr(0, sp); b = t.substr(sp + 1); }
     else { a = m[0].get<std::string>(); b = m[1].get<std::string>(); }
-    auto ia = token_to_id_.find(a), ib = token_to_id_.find(b);
-    if (ia == token_to_id_.end() || ib == token_to_id_.end()) continue;
-    merge_rank_.emplace(std::make_pair(ia->second, ib->second), rank++);
+    auto ia = token_to_id_.find(a), ib = token_to_id_.find(b), ic = token_to_id_.find(a + b);
+    if (ia == token_to_id_.end() || ib == token_to_id_.end() || ic == token_to_id_.end()) continue;
+    merges_.emplace(std::make_pair(ia->second, ib->second), Merge{rank++, ic->second});
+  }
+
+  // Family detection, plus the byte-fallback table when the model declares it.
+  const bool byte_level_pre = j.contains("pre_tokenizer") && !j["pre_tokenizer"].is_null() &&
+                              j["pre_tokenizer"].dump().find("ByteLevel") != std::string::npos;
+  family_ = byte_level_pre ? TokenizerFamily::ByteLevel : TokenizerFamily::Metaspace;
+  if (family_ == TokenizerFamily::Metaspace) {
+    byte_fallback_.assign(256, -1);
+    char buf[8];
+    for (int b = 0; b < 256; b++) {
+      std::snprintf(buf, sizeof(buf), "<0x%02X>", b);
+      auto it = token_to_id_.find(buf);
+      if (it != token_to_id_.end()) byte_fallback_[b] = it->second;
+    }
+    if (model.contains("unk_token") && model["unk_token"].is_string()) {
+      auto it = token_to_id_.find(model["unk_token"].get<std::string>());
+      if (it != token_to_id_.end()) unk_id_ = it->second;
+    }
+  }
+  // A post-processor that inserts <s> in front of every sequence means the model
+  // expects BOS; Qwen's post-processor is a plain ByteLevel pass and does not.
+  if (j.contains("post_processor") && !j["post_processor"].is_null()) {
+    const std::string pp = j["post_processor"].dump();
+    prepend_bos_ = pp.find("TemplateProcessing") != std::string::npos && pp.find("<s>") != std::string::npos;
   }
 
   for (const auto& t : j.value("added_tokens", nlohmann::json::array())) {
@@ -120,6 +145,7 @@ Tokenizer::Tokenizer(const std::string& model_dir) {
     eos_token_ = tok_str("eos_token");
     bos_token_ = tok_str("bos_token");
     if (auto it = token_to_id_.find(eos_token_); it != token_to_id_.end()) eos_id_ = it->second;
+    if (auto it = token_to_id_.find(bos_token_); it != token_to_id_.end()) bos_id_ = it->second;
     std::string tmpl = c.value("chat_template", "");
     chatml_ = tmpl.find("<|im_start|>") != std::string::npos;
     if (auto it = token_to_id_.find("<|im_end|>"); chatml_ && it != token_to_id_.end()) eot_id_ = it->second;
@@ -195,33 +221,70 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
   return out;
 }
 
+void Tokenizer::bpe_merge(std::vector<int32_t>& ids) const {
+  while (ids.size() >= 2) {
+    int32_t best_rank = INT32_MAX, merged_id = -1; size_t best_i = 0;
+    for (size_t i = 0; i + 1 < ids.size(); i++) {
+      auto it = merges_.find({ids[i], ids[i + 1]});
+      if (it != merges_.end() && it->second.rank < best_rank) {
+        best_rank = it->second.rank; merged_id = it->second.id; best_i = i;
+      }
+    }
+    if (best_rank == INT32_MAX) return;
+    // Apply every occurrence of the winning pair, left to right.
+    std::vector<int32_t> next; next.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); i++) {
+      if (i + 1 < ids.size() && ids[i] == ids[best_i] && ids[i + 1] == ids[best_i + 1]) { next.push_back(merged_id); i++; }
+      else next.push_back(ids[i]);
+    }
+    ids.swap(next);
+  }
+}
+
 std::vector<int32_t> Tokenizer::bpe(const std::string& word) const {
-  // Map bytes -> byte-level alphabet symbols -> initial ids.
+  // Byte-level family: every byte has a printable placeholder in the vocabulary.
   std::vector<int32_t> ids;
   for (unsigned char b : word) {
     auto it = token_to_id_.find(byte_to_unicode_[b]);
     if (it == token_to_id_.end()) throw std::runtime_error("byte symbol missing from vocab");
     ids.push_back(it->second);
   }
-  if (ids.size() < 2) return ids;
-  while (true) {
-    int32_t best_rank = INT32_MAX; size_t best_i = 0;
-    for (size_t i = 0; i + 1 < ids.size(); i++) {
-      auto it = merge_rank_.find({ids[i], ids[i + 1]});
-      if (it != merge_rank_.end() && it->second < best_rank) { best_rank = it->second; best_i = i; }
-    }
-    if (best_rank == INT32_MAX) break;
-    const std::string merged = id_to_token_[ids[best_i]] + id_to_token_[ids[best_i + 1]];
-    int32_t mid = token_to_id_.at(merged);
-    // merge every occurrence of this pair (same rank), left to right
-    std::vector<int32_t> next; next.reserve(ids.size());
-    for (size_t i = 0; i < ids.size(); i++) {
-      if (i + 1 < ids.size() && ids[i] == ids[best_i] && ids[i + 1] == ids[best_i + 1]) { next.push_back(mid); i++; }
-      else next.push_back(ids[i]);
-    }
-    ids.swap(next);
-    if (ids.size() < 2) break;
+  bpe_merge(ids);
+  return ids;
+}
+
+std::vector<int32_t> Tokenizer::encode_byte_level(const std::string& text) const {
+  std::vector<int32_t> out;
+  for (const auto& w : pre_tokenize(text)) {
+    auto ids = bpe(w);
+    out.insert(out.end(), ids.begin(), ids.end());
   }
+  return out;
+}
+
+// Llama / sentencepiece: no pre-tokenizer. Normalise by prepending U+2581 and
+// turning every space into U+2581, then run BPE over the characters. A character
+// absent from the vocabulary becomes one <0xNN> token per UTF-8 byte.
+std::vector<int32_t> Tokenizer::encode_metaspace(const std::string& text) const {
+  static const std::string kMeta = "\xe2\x96\x81";  // U+2581 LOWER ONE EIGHTH BLOCK
+  std::string norm = kMeta;
+  for (size_t i = 0; i < text.size(); i++) norm += text[i] == ' ' ? kMeta : std::string(1, text[i]);
+
+  std::vector<int32_t> ids;
+  for (size_t i = 0; i < norm.size();) {
+    uint32_t cp; size_t len = utf8_decode(norm, i, cp);
+    const std::string ch = norm.substr(i, len);
+    i += len;
+    auto it = token_to_id_.find(ch);
+    if (it != token_to_id_.end()) { ids.push_back(it->second); continue; }
+    bool fell_back = false;
+    for (unsigned char b : ch) {
+      const int32_t id = byte_fallback_.empty() ? -1 : byte_fallback_[b];
+      if (id >= 0) { ids.push_back(id); fell_back = true; }
+    }
+    if (!fell_back && unk_id_ >= 0) ids.push_back(unk_id_);
+  }
+  bpe_merge(ids);
   return ids;
 }
 
@@ -236,18 +299,40 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
       if (at != std::string::npos && (best == nullptr || at < best_at || (at == best_at && t.first.size() > best->first.size()))) { best_at = at; best = &t; }
     }
     size_t end = best ? best_at : text.size();
-    if (end > pos)
-      for (const auto& w : pre_tokenize(text.substr(pos, end - pos))) { auto ids = bpe(w); out.insert(out.end(), ids.begin(), ids.end()); }
+    if (end > pos) {
+      const std::string chunk = text.substr(pos, end - pos);
+      auto ids = family_ == TokenizerFamily::ByteLevel ? encode_byte_level(chunk) : encode_metaspace(chunk);
+      out.insert(out.end(), ids.begin(), ids.end());
+    }
     if (best) { out.push_back(best->second); pos = best_at + best->first.size(); }
     else pos = end;
   }
   return out;
 }
 
+std::vector<int32_t> Tokenizer::encode_for_generation(const std::string& text) const {
+  std::vector<int32_t> ids;
+  if (prepend_bos_ && bos_id_ >= 0) ids.push_back(bos_id_);
+  auto body = encode(text);
+  ids.insert(ids.end(), body.begin(), body.end());
+  return ids;
+}
+
 std::string Tokenizer::decode_token(int32_t id) const {
   if (id < 0 || static_cast<size_t>(id) >= id_to_token_.size()) return "";
   const std::string& tok = id_to_token_[id];
   for (const auto& a : added_tokens_) if (a.second == id) return tok;  // special tokens are stored raw
+  if (family_ == TokenizerFamily::Metaspace) {
+    // <0xNN> carries a raw byte; otherwise U+2581 is a space.
+    if (tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>')
+      return std::string(1, static_cast<char>(std::stoi(tok.substr(3, 2), nullptr, 16)));
+    std::string out;
+    for (size_t i = 0; i < tok.size();) {
+      if (tok.compare(i, 3, "\xe2\x96\x81") == 0) { out += ' '; i += 3; }
+      else out += tok[i++];
+    }
+    return out;
+  }
   std::string out;
   for (size_t i = 0; i < tok.size();) {
     uint32_t cp; size_t len = utf8_decode(tok, i, cp);
@@ -261,6 +346,9 @@ std::string Tokenizer::decode_token(int32_t id) const {
 std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
   std::string out;
   for (int32_t id : ids) out += decode_token(id);
+  // The metaspace normaliser prepended a space marker, so the decoder strips one
+  // leading space back off again.
+  if (family_ == TokenizerFamily::Metaspace && !out.empty() && out[0] == ' ') out.erase(0, 1);
   return out;
 }
 
