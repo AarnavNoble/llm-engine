@@ -104,17 +104,18 @@ Mac, CPU backend, 8 concurrent, 8 output tokens:
 
 | | cache off | cache on | change |
 |---|---|---|---|
-| TTFT p50 | 18,019 ms | 7,284 ms | **2.5x faster** |
-| TTFT p95 | 20,973 ms | 10,267 ms | 2.0x faster |
-| end-to-end p50 | 23.3 s | 10.2 s | 2.3x faster |
-| wall clock | 93.9 s | 42.7 s | 2.2x faster |
+| TTFT p50 | 20,118 ms | 7,268 ms | **2.8x faster** |
+| TTFT p95 | 27,874 ms | 8,610 ms | 3.2x faster |
+| end-to-end p50 | 24.4 s | 8.5 s | 2.9x faster |
+| wall clock | 101.7 s | 35.0 s | 2.9x faster |
 
-Hit ratio was 75%: 960 of 1,280 full prompt blocks. The ceiling for this
-workload is 77.5% — 32 of every 40 prompt blocks are shared, and the very
-first request necessarily misses. The remaining gap is the cold start: with
-eight concurrent requests, the first few begin prefilling before any block has
-been published, so they cannot share with each other. Blocks are published as
-each one fills, which is why only two requests missed rather than all eight.
+Hit ratio is 77.5%, 992 of 1,280 full prompt blocks, which is exactly the ceiling
+for this workload: 32 of every 40 prompt blocks are shared and the very first
+request must miss, giving 31 x 32 = 992. An earlier run of the same experiment
+reached only 75%, because with the unbatched forward pass the first few
+concurrent requests each began prefilling before any block had been published and
+so could not share with one another. Packing the step shrank that cold-start
+window to a single request.
 
 The tokens/s figures in this experiment (2.7 to 6.0) are not a decode
 throughput claim. Each request generates only 8 tokens against a 640-token
@@ -133,12 +134,16 @@ Mac, CPU backend:
 
 | chunk | ITL p50 | ITL p95 | worst gap | injected prompt TTFT |
 |---|---|---|---|---|
-| 2048 (effectively unchunked) | 152 ms | 314 ms | **23,972 ms** | 24.38 s |
-| 512 | 148 ms | 6,955 ms | 9,895 ms | 24.30 s |
-| 128 | 148 ms | **2,556 ms** | **2,785 ms** | 25.00 s |
+| 2048 (effectively unchunked) | 92 ms | 561 ms | **23,203 ms** | 23.81 s |
+| 512 | 89 ms | 6,813 ms | 9,750 ms | 23.63 s |
+| 128 | 91 ms | **1,653 ms** | **1,969 ms** | 24.69 s |
 
-The worst-case stall falls 8.6x, from 24.0 s to 2.8 s, and the arriving
-request's own TTFT is barely affected (24.4 s to 25.0 s, about 2.5%).
+The worst-case stall falls 11.8x, from 23.2 s to 2.0 s, and the arriving
+request's own TTFT is barely affected (23.8 s to 24.7 s, about 3.6%). Note that
+the injected prompt's own prefill time did not improve when the forward pass was
+batched: a single 2,048-token prefill was already one slice, so there was nothing
+to pack it with. Batching helps a step that contains several sequences, not a
+step that contains one large one.
 
 The p95 column moves the other way, and that is not a contradiction. Total
 prefill work is conserved: chunking does not make the prompt cheaper, it splits
@@ -245,6 +250,17 @@ is now shared more ways. This is fair-sharing, not a throughput gain: on the
 GPU the batch is close to free, so the long-request regression should largely
 disappear. Whether it does is a measurement, not an assumption, and it is one
 of the first things to check once the CUDA backend runs.
+
+## Keeping published numbers honest
+
+Every number here is re-run when the code underneath it changes, and the shifts
+are explained rather than quietly swapped. Batching the forward pass moved three
+of them: continuous batching became measurable at all, the prefix hit ratio rose
+from 75% to its 77.5% ceiling because the cold-start window shrank, and the
+chunked-prefill stall improved from 8.6x to 11.8x because decode tokens now share
+a step with the prefill chunk instead of running after it. The KV-efficiency
+table is unaffected, because it runs against a fake model and measures the
+allocator alone.
 
 ## Table status
 
