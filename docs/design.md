@@ -42,6 +42,22 @@ Sharing only ever involves full blocks, so copy-on-write is never needed: a sequ
 - Preemption picks the youngest running sequence (most recently admitted) — the cheapest to recompute and the least likely to starve others. Recompute-on-resume rather than swap-to-host: simpler, correct, and on a 0.5B model recompute is cheap.
 - Static mode: the batch is admitted together; members that finish keep their slot and their blocks (they stop computing, which is slightly *kind* to the baseline) until the last member finishes, then everything frees at once.
 
+## CPU threading
+
+GEMMs go to BLAS, which threads them already. Attention does not: it is a loop
+over (token, head) where each item walks its own sequence's block table for its
+own length, so `ThreadPool::parallel_for` splits that index space. Each item
+writes only its own head slice, so there is no race and the result is
+independent of the split, which `ENGINE_THREADS=1` versus `ENGINE_THREADS=8`
+producing identical token ids confirms.
+
+The pool is persistent, because the loop runs once per layer per step and
+spawning threads per call would cost more than the work. It is also gated: the
+model estimates the attention work first and stays single-threaded below a
+threshold, since the pool costs a wake-up per layer per step and competes with
+the BLAS threads. Threading unconditionally made short-context batches slower
+while long contexts sped up several-fold, which is the shape the gate encodes.
+
 ## Numerics
 
 - Weights are bf16 on disk. CPU path upcasts to fp32 and matches the PyTorch fp32 reference to ~1e-4 (tolerance 2e-3 relative on the residual stream). CUDA path uses fp16 weights/activations with fp32 accumulation; expect ~1e-2 on logits and occasional argmax flips on near-ties — the test tolerates a flip only when the reference top-2 gap is below the observed error.

@@ -88,6 +88,21 @@ throughput, where the arithmetic intensity of a batched GEMM is the whole point
 and the gain should be larger. They do establish that the scheduler earns its
 complexity, which could not be shown before.
 
+Attention is threaded separately, since BLAS only covers the GEMMs. The benefit
+depends entirely on context length, because attention cost grows with it while
+the pool's overhead does not:
+
+| | 1 thread | 8 threads |
+|---|---|---|
+| 2,048-token context, decode | 0.71 tok/s | **2.60 tok/s** (3.7x) |
+| 30-token context, 16 concurrent | 108-149 tok/s | 140-152 tok/s |
+
+The second row is noise in both columns, which is the point: below a work
+threshold the model stays single-threaded, because threading unconditionally cost
+short-context batches more in synchronisation and BLAS contention than it saved.
+Thread count does not change the output; `ENGINE_THREADS=1` and `ENGINE_THREADS=8`
+produce identical token ids.
+
 Packing correctness is tested, not assumed: a sequence's logits must not depend
 on who else is in the step. Two tests cover it, one comparing three sequences
 packed together against each run alone, and one checking a mid-generation decode
