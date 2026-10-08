@@ -264,3 +264,117 @@ TEST_CASE("cpu model: a decode token packed beside a prefill chunk is unaffected
   F.kv.free(decoder->block_table);
   F.kv.free(other->block_table);
 }
+
+TEST_CASE("cpu model: chunked prefill gives the same logits as one-shot prefill", "[model][slow]") {
+  // Chunking a prompt changes how many tokens share a forward pass and how the
+  // block table is walked, but it must not change the answer. Position
+  // arithmetic at chunk and block boundaries is where that would break.
+  Fixture& F = Fixture::primary();
+  auto P = load_prompts(F.data);
+  const int V = F.model->config().vocab_size;
+
+  // The long prompt is the only one that spans dozens of blocks.
+  size_t longest = 0;
+  for (size_t i = 0; i < P["prompts"].size(); i++)
+    if (P["prompts"][i]["ids"].size() > P["prompts"][longest]["ids"].size()) longest = i;
+  auto ids = P["prompts"][longest]["ids"].get<std::vector<int32_t>>();
+  REQUIRE(ids.size() > 400);
+
+  auto run = [&](int chunk) {
+    auto s = std::make_shared<Sequence>();
+    s->tokens = ids;
+    s->prompt_len = s->num_tokens();
+    REQUIRE(F.kv.allocate_prompt(s->block_table, s->tokens).has_value());
+    std::vector<float> logits;
+    int computed = 0;
+    while (computed < s->num_tokens()) {
+      const int len = std::min(chunk, s->num_tokens() - computed);
+      StepInput step;
+      StepSlice sl; sl.seq = s.get(); sl.start = computed; sl.len = len; sl.is_prefill = true;
+      sl.needs_logits = (computed + len == s->num_tokens());
+      step.slices.push_back(sl); step.num_prefill_tokens = len;
+      step.num_logits = sl.needs_logits ? 1 : 0;
+      F.model->forward(step, logits);
+      computed += len;
+    }
+    F.kv.free(s->block_table);
+    return logits;
+  };
+
+  const auto one_shot = run(static_cast<int>(ids.size()));
+  REQUIRE(one_shot.size() == static_cast<size_t>(V));
+  // 16 aligns with the block size, 128 spans blocks, 37 is deliberately coprime
+  // with it so chunk boundaries fall mid-block.
+  for (int chunk : {16, 37, 128}) {
+    const auto chunked = run(chunk);
+    float worst = 0;
+    for (int t = 0; t < V; t++) worst = std::max(worst, std::fabs(one_shot[t] - chunked[t]));
+    INFO("chunk " << chunk << ": max |one-shot - chunked| = " << worst);
+    CHECK(worst < 2e-3f);
+    CHECK(Sampler::argmax(chunked.data(), V) == Sampler::argmax(one_shot.data(), V));
+  }
+}
+
+TEST_CASE("cpu model: a preempted sequence resumes with identical output", "[model][slow]") {
+  // Recompute-on-resume throws away the KV cache and re-prefills prompt plus
+  // everything generated so far. If positions came from anywhere other than the
+  // sequence itself, RoPE would be applied at the wrong offsets and the
+  // continuation would diverge. This is the bug the design notes predicted.
+  Fixture& F = Fixture::primary();
+  auto P = load_prompts(F.data);
+  const int V = F.model->config().vocab_size;
+
+  auto ids = P["prompts"][1]["ids"].get<std::vector<int32_t>>();
+  const int kGenerate = 12;
+
+  auto generate = [&](int preempt_after) {
+    auto s = std::make_shared<Sequence>();
+    s->tokens = ids;
+    s->prompt_len = s->num_tokens();
+    REQUIRE(F.kv.allocate_prompt(s->block_table, s->tokens).has_value());
+    int computed = 0;
+    std::vector<float> logits;
+    std::vector<int32_t> produced;
+
+    auto forward_range = [&](int start, int len, bool want_logits) {
+      StepInput step;
+      StepSlice sl; sl.seq = s.get(); sl.start = start; sl.len = len;
+      sl.is_prefill = len > 1; sl.needs_logits = want_logits;
+      step.slices.push_back(sl);
+      if (len > 1) step.num_prefill_tokens = len; else step.num_decode_tokens = 1;
+      step.num_logits = want_logits ? 1 : 0;
+      F.model->forward(step, logits);
+    };
+
+    forward_range(0, s->num_tokens(), true);
+    computed = s->num_tokens();
+    for (int g = 0; g < kGenerate; g++) {
+      const int32_t tok = Sampler::argmax(logits.data(), V);
+      produced.push_back(tok);
+      s->tokens.push_back(tok);
+      if (g + 1 == preempt_after) {
+        // Preempt exactly as the scheduler does: drop the cache, reallocate, and
+        // re-prefill prompt plus generated tokens.
+        F.kv.free(s->block_table);
+        REQUIRE(F.kv.allocate_prompt(s->block_table, s->tokens).has_value());
+        forward_range(0, s->num_tokens(), true);
+        computed = s->num_tokens();
+        continue;
+      }
+      REQUIRE(F.kv.ensure_slot(s->block_table, s->num_tokens()));
+      forward_range(computed, 1, true);
+      computed = s->num_tokens();
+    }
+    F.kv.free(s->block_table);
+    return produced;
+  };
+
+  const auto baseline = generate(-1);
+  REQUIRE(baseline.size() == static_cast<size_t>(kGenerate));
+  // Preempt at a few points, including one that lands on a block boundary.
+  for (int at : {1, 5, 8}) {
+    const auto resumed = generate(at);
+    INFO("preempted after " << at << " generated tokens");
+    CHECK(resumed == baseline);
+  }
+}

@@ -36,6 +36,12 @@ chats = []
 if "qwen" in name.lower():
     chats = [[{"role": "user", "content": "What is paged attention? Answer in one sentence."}],
              [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Name three GPU vendors."}]]
+# One deliberately long prompt: it spans dozens of KV blocks, exercises RoPE at
+# high positions, and is the only case where chunked prefill splits a sequence.
+LONG_PROMPT = ("A paged attention implementation stores keys and values in fixed-size blocks so that "
+               "memory is allocated on demand and returned the moment a sequence finishes. "
+               "Each sequence owns a block table mapping logical positions to physical blocks. ") * 12
+texts.append(LONG_PROMPT.strip())
 prompts = [{"text": t, "ids": tok.encode(t, add_special_tokens=False)} for t in texts]
 for c in chats:
     r = tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True)

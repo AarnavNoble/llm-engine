@@ -100,6 +100,32 @@ Still not generic: chat templates. Only ChatML is implemented, so
 "only ChatML chat templates are implemented" rather than silently using the
 wrong prompt format. `/v1/completions` works for both models.
 
+## Invariances the tests pin
+
+Three properties have to hold for paging and continuous batching to be safe,
+and none of them is obvious from reading the code:
+
+- **Batching invariance.** A token's logits must not depend on who else is in
+  the step. Checked by running three sequences packed together against each one
+  alone, and by putting a mid-generation decode token beside someone else's
+  prefill chunk.
+- **Chunk invariance.** Splitting a prompt changes how many tokens share a
+  forward pass and how the block table is walked, but not the answer. Checked on
+  a 492-token prompt spanning 31 blocks, at chunk sizes 16 (block-aligned), 128
+  (spanning blocks) and 37 (coprime with the block size, so boundaries land
+  mid-block).
+- **Preemption invariance.** Recompute-on-resume discards the cache and
+  re-prefills prompt plus everything generated so far. If positions came from
+  anywhere other than the sequence itself, RoPE would be applied at the wrong
+  offsets and the continuation would silently diverge. Checked by preempting
+  after 1, 5 and 8 generated tokens and requiring the full continuation to match
+  the uninterrupted run exactly.
+
+The design notes had predicted a RoPE off-by-one after preemption as the most
+likely hard bug. It never happened, because positions are read from the sequence
+rather than tracked alongside it, but that is now a tested property instead of
+an accident.
+
 ## Lessons recorded
 
 - A missing test fixture must not read as a pass. The per-layer dumps are
