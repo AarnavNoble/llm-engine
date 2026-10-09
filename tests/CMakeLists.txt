@@ -8,6 +8,7 @@ add_executable(engine_tests
   test_tensor.cpp
   test_block_allocator.cpp
   test_scheduler.cpp
+  test_stress.cpp
   test_sampler.cpp
   test_metrics.cpp
   test_cpu_model.cpp

@@ -482,3 +482,80 @@ TEST_CASE("scheduler: a long-waiting request may not be overtaken") {
   for (auto& s : {resident, big, small}) REQUIRE(s->is_finished());
   REQUIRE(kv.num_used_blocks() == 0);
 }
+
+TEST_CASE("scheduler: preempting a mid-prefill sequence leaves no stale slice") {
+  // Regression. Slices used to be built before preemption was settled, so a
+  // sequence still mid-prefill could be evicted in the same step that had
+  // already emitted a slice for it, leaving the model a slice whose start no
+  // longer matched the sequence's computed length.
+  //
+  // 6 blocks of 16. A takes 2 blocks and decodes; B's 60-token prompt takes 4
+  // and is prefilled in chunks, so the pool is full and A's next block forces an
+  // eviction. B is the youngest, so B is the victim.
+  KVCacheManager kv(6, 16, false);
+  SchedulerConfig cfg;
+  cfg.max_num_batched_tokens = 64;
+  cfg.prefill_chunk_size = 16;
+  cfg.watermark_blocks = 0;        // let the pool fill, so eviction is forced
+  Scheduler sch(cfg, kv);
+  auto a = make_seq(1, 32, 40);
+  auto b = make_seq(2, 60, 4);
+  sch.add(a);
+  FakeModel m;
+  auto st = sch.schedule(); sch.on_step_done(st, m.run(st));   // A prefilled
+  sch.add(b);
+  st = sch.schedule();                                          // B admitted, chunked
+  sch.on_step_done(st, m.run(st));
+  REQUIRE(sch.num_running() == 2);
+  REQUIRE_FALSE(b->prefill_done());
+
+  // Drive until an eviction happens, checking every step's slices stay valid.
+  int steps = 0;
+  while (sch.stats().preemptions == 0 && sch.stats().finished == 0 && steps < 60) {
+    st = sch.schedule();
+    for (const auto& sl : st.slices) {
+      REQUIRE(sl.start == sl.seq->num_computed);                // the invariant that broke
+      REQUIRE(sl.start + sl.len <= sl.seq->num_tokens());
+    }
+    sch.on_step_done(st, m.run(st));
+    steps++;
+  }
+  REQUIRE(sch.stats().preemptions == 1);
+  REQUIRE(b->num_preemptions == 1);
+  REQUIRE(b->num_computed == 0);
+  drive(sch, m);
+  REQUIRE(a->num_generated() == 40);
+  REQUIRE(b->num_generated() == 4);
+  REQUIRE(kv.num_used_blocks() == 0);
+}
+
+TEST_CASE("scheduler: static batching releases finished members instead of resurrecting them") {
+  // Regression. In static mode a member that hits its cap keeps its blocks to
+  // emulate padded generation. Memory pressure used to pick it as the preemption
+  // victim, which reset it to Waiting, re-admitted it, and let it generate past
+  // max_tokens. A finished member must have its blocks released instead.
+  KVCacheManager kv(8, 2, true);
+  SchedulerConfig cfg;
+  cfg.continuous = false;
+  cfg.max_num_seqs = 2;
+  cfg.max_num_batched_tokens = 16;
+  cfg.watermark_blocks = 0;
+  Scheduler sch(cfg, kv);
+  std::vector<SequencePtr> seqs;
+  // Short and long caps in the same batch, so one finishes while the other is
+  // still growing and needs new blocks.
+  seqs.push_back(make_seq(1, 2, 2));
+  seqs.push_back(make_seq(2, 2, 7));
+  for (int i = 3; i <= 6; i++) seqs.push_back(make_seq(static_cast<uint64_t>(i), 2, 3));
+  for (auto& s : seqs) sch.add(s);
+
+  FakeModel m;
+  drive(sch, m);
+  for (const auto& s : seqs) {
+    INFO("sequence " << s->id);
+    REQUIRE(s->is_finished());
+    REQUIRE(s->num_generated() == s->params.max_tokens);   // never past the cap
+    REQUIRE(s->num_preemptions == 0);                      // a finished member is not preempted
+  }
+  REQUIRE(kv.num_used_blocks() == 0);
+}

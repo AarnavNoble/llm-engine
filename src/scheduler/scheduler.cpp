@@ -87,20 +87,45 @@ bool Scheduler::admission_fits(const Sequence& s) const {
   return kv_.num_available_blocks() - (needed - reused) >= watermark;
 }
 
-void Scheduler::preempt_youngest() {
-  // Recompute-on-resume: drop the most recently admitted sequence's cache and
-  // put it back at the head of the queue. Its generated tokens are kept as
-  // part of the "prompt" it will re-prefill.
-  assert(!running_.empty());
-  SequencePtr s = running_.back();
-  running_.pop_back();
-  kv_.free(s->block_table);
-  stats_.recomputed_tokens += static_cast<uint64_t>(s->num_computed);
-  s->num_computed = 0;
-  s->num_preemptions++;
-  s->status = SeqStatus::Waiting;
-  waiting_.push_front(s);
-  stats_.preemptions++;
+// Make room for a resident sequence to grow. Preference order matters:
+//
+//   1. A finished sequence that is still holding blocks. Only static batching
+//      produces these, where a member that hit its cap keeps its slot to
+//      emulate padded generation. Its K/V will never be read again, so
+//      releasing them costs nothing, and it must be released rather than
+//      preempted: preemption resets a sequence to Waiting, which would
+//      resurrect a completed request and let it generate past max_tokens.
+//   2. Otherwise the youngest live sequence, which is recomputed on resume.
+bool Scheduler::evict_for_memory(std::vector<Sequence*>& mid_prefill, std::vector<Sequence*>& decode) {
+  auto forget = [&](Sequence* victim) {
+    mid_prefill.erase(std::remove(mid_prefill.begin(), mid_prefill.end(), victim), mid_prefill.end());
+    decode.erase(std::remove(decode.begin(), decode.end(), victim), decode.end());
+  };
+
+  for (size_t i = running_.size(); i-- > 0;) {
+    if (!running_[i]->is_finished()) continue;
+    SequencePtr s = running_[i];
+    running_.erase(running_.begin() + static_cast<long>(i));
+    kv_.free(s->block_table);
+    stats_.finished++;
+    forget(s.get());
+    return true;
+  }
+
+  for (size_t i = running_.size(); i-- > 0;) {
+    SequencePtr s = running_[i];
+    running_.erase(running_.begin() + static_cast<long>(i));
+    kv_.free(s->block_table);
+    stats_.recomputed_tokens += static_cast<uint64_t>(s->num_computed);
+    s->num_computed = 0;
+    s->num_preemptions++;
+    s->status = SeqStatus::Waiting;
+    waiting_.push_front(s);
+    stats_.preemptions++;
+    forget(s.get());
+    return true;
+  }
+  return false;
 }
 
 StepInput Scheduler::schedule() {
@@ -113,35 +138,38 @@ StepInput Scheduler::schedule() {
   if (!cfg_.continuous && running_.empty()) static_batch_open_ = true;
   const bool may_admit = cfg_.continuous || static_batch_open_;
 
-  // 1. Running sequences. A sequence still mid-prefill (chunked) gets its next
-  //    chunk now; sequences past their prompt are collected for decode.
-  std::vector<Sequence*> decode;
+  // 1. Split the resident sequences. No slices are built yet: preemption below
+  //    can evict any of them, and a slice referring to an evicted sequence would
+  //    point at a position it no longer has.
+  std::vector<Sequence*> mid_prefill, decode;
   for (auto& s : running_) {
     if (s->is_finished()) continue;  // static mode keeps finished members around
-    if (!s->prefill_done()) {
-      int len = std::min({s->num_tokens() - s->num_computed, budget, cfg_.prefill_chunk_size});
-      if (len > 0) { add_prefill_slice(step, *s, len); budget -= len; }
-    } else {
-      decode.push_back(s.get());
-    }
+    (s->prefill_done() ? decode : mid_prefill).push_back(s.get());
   }
 
   // 2. Every decode token needs a physical slot for its K/V. When the pool is
-  //    exhausted, preempt the youngest running sequence (recompute-on-resume)
-  //    and retry; the victim may be the sequence we were trying to place.
+  //    exhausted, preempt the youngest resident sequence (recompute-on-resume)
+  //    and retry. The victim may be the sequence we were trying to place, or one
+  //    that is still mid-prefill, so it has to leave both lists.
   for (size_t i = 0; i < decode.size();) {
     Sequence* s = decode[i];
     if (kv_.ensure_slot(s->block_table, s->num_tokens())) { i++; continue; }
-    Sequence* victim = running_.back().get();
-    preempt_youngest();
-    decode.erase(std::remove(decode.begin(), decode.end(), victim), decode.end());
-    // if victim == s, decode[i] is now the next sequence; either way re-examine index i
+    // The victim may be the sequence we were trying to place, or one that is
+    // still mid-prefill, so evict_for_memory removes it from both lists and we
+    // retry the same index.
+    if (!evict_for_memory(mid_prefill, decode)) { decode.erase(decode.begin() + static_cast<long>(i)); }
+  }
+
+  // 3. Now that the resident set is settled, build its slices. Prefill chunks go
+  //    first so the model sees [prefill..., decode...].
+  for (Sequence* s : mid_prefill) {
+    const int len = std::min({s->num_tokens() - s->num_computed, budget, cfg_.prefill_chunk_size});
+    if (len > 0) { add_prefill_slice(step, *s, len); budget -= len; }
   }
   if (static_cast<int>(decode.size()) > budget) decode.resize(static_cast<size_t>(budget));
   budget -= static_cast<int>(decode.size());
 
-  // 3. Admit waiting sequences under the remaining budget (FCFS). Their prefill
-  //    slices go before the decode slices so the model sees [prefill..., decode...].
+  // 4. Admit waiting sequences under the remaining budget (FCFS).
   if (may_admit) {
     for (auto& w : waiting_) w->wait_steps++;
     while (admit_one(step, budget)) {}

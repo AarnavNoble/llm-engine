@@ -126,6 +126,35 @@ likely hard bug. It never happened, because positions are read from the sequence
 rather than tracked alongside it, but that is now a tested property instead of
 an accident.
 
+## Randomised stress testing
+
+`tests/test_stress.cpp` generates random configurations (block size, pool size,
+sequence and token budgets, chunk size, lookahead, watermark, prefix caching,
+continuous or static) and random workloads with shared prefixes and mid-flight
+aborts, then asserts the invariants that must hold for any schedule: block
+accounting balances at every step, no sequence computes more tokens than it has
+or generates past its cap, every request reaches a terminal state, the pool is
+empty once the queue drains, and the scheduler always makes progress. 400
+iterations run in CI in under a second; `ENGINE_STRESS_ITERS` raises it, and a
+failure prints the seed and the full configuration so it can be reproduced
+alone. 6,000 iterations is currently clean at 13.1M assertions.
+
+It found two bugs on its first run, both in combinations the hand-written tests
+did not cover:
+
+- **Stale slices.** Slices were built before preemption was settled, so a
+  sequence still mid-prefill could be evicted in the same step that had already
+  emitted a slice for it. The model would then receive a slice whose `start` no
+  longer matched the sequence's computed length. `schedule()` now settles the
+  resident set first and builds slices afterwards.
+- **Resurrected sequences.** Static batching keeps a member that has hit its cap
+  resident, holding its blocks, to emulate padded generation. Memory pressure
+  picked it as the preemption victim, and preemption resets a sequence to
+  Waiting, so a completed request was re-admitted and generated past its own
+  `max_tokens`. Eviction now prefers a finished member and releases its blocks
+  outright, which is both correct and cheaper, since its K/V will never be read
+  again.
+
 ## Lessons recorded
 
 - A missing test fixture must not read as a pass. The per-layer dumps are

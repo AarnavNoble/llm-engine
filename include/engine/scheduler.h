@@ -75,8 +75,10 @@ class Scheduler {
 
  private:
   bool admit_one(StepInput& step, int& budget);
+  // Frees blocks for one resident sequence so another can grow, removing it from
+  // the caller's candidate lists. False when nothing could be freed.
+  bool evict_for_memory(std::vector<Sequence*>& mid_prefill, std::vector<Sequence*>& decode);
   bool admission_fits(const Sequence& s) const;
-  void preempt_youngest();
   void retire(SequencePtr seq, FinishReason r);
   void add_prefill_slice(StepInput& step, Sequence& s, int len);
 
