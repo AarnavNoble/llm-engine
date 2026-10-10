@@ -98,6 +98,26 @@ def main():
         used.add(name)
         check_reference(name, "keda/scaledobject", kinds)
 
+    # Alert rules fail the same silent way: a renamed metric makes the
+    # expression return nothing, which looks exactly like "everything is fine".
+    rules_path = ROOT / "deploy/helm/templates/prometheusrule.yaml"
+    if rules_path.exists():
+        rules = rules_path.read_text()
+        for name in re.findall(r"\bengine_[a-z_]+", rules):
+            used.add(name)
+            check_reference(name, "alerts/prometheusrule", kinds)
+        # Every alert needs a severity and an annotation saying what to do about
+        # it, or it is noise that trains people to ignore the next one.
+        alerts = re.findall(r"- alert: (\w+)", rules)
+        for a in alerts:
+            block = rules[rules.index(f"- alert: {a}"):]
+            block = block[:block.find("- alert:", 1) if block.find("- alert:", 1) > 0 else len(block)]
+            if "severity:" not in block:
+                errors.append(f"alert {a} has no severity label")
+            if "description:" not in block:
+                errors.append(f"alert {a} has no description saying what to do")
+        print(f"checked {len(alerts)} alert rules")
+
     unused = sorted(set(kinds) - {n.replace("_bucket", "").replace("_sum", "").replace("_count", "") for n in used})
     print(f"checked {checked} references across the dashboard and the KEDA trigger")
     if unused:

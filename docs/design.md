@@ -177,6 +177,50 @@ assert the latter, but it segfaults on a two-thread hello world on this machine
 both sanitizers is therefore a step in `docs/gpu-setup.md`, to be done on the
 Linux GPU box, rather than something quietly skipped.
 
+## Failure detection and overload
+
+Four classic principles, each answering a way the server can go wrong in a way
+that is otherwise invisible.
+
+**Liveness must be able to fail.** `/healthz` used to return `ok`
+unconditionally, which makes the probe decorative: a deadlocked step loop or a
+hung kernel would never be restarted. It now reports `Engine::health()`, which
+fails when the model is not loaded, when the loop is not running, when the KV
+accounting invariant breaks, or when work is queued and no step has completed
+within `stall_timeout_seconds`.
+
+The subtlety is that the loop sleeps when idle, so "no recent step" is the
+normal state of a healthy unused server. The first implementation reported an
+idle engine as dead after a few minutes, which would have crash-looped a working
+pod. A stall is therefore defined as *work pending and not advancing*, using a
+queue counter both threads update, and the idle loop waits with a timeout so it
+keeps stamping progress. Readiness stays a separate question, because a draining
+engine is unready and perfectly alive.
+
+**Bound the queue.** Accepting work without limit does not make it finish
+sooner: if arrivals outpace service, the queue and every request's latency grow
+without bound. Past `max_queue_depth` the engine returns 429 with `Retry-After`,
+so a client can retry or shed its own load while accepted requests keep their
+latency. The counters distinguish the three refusals, because they call for
+different responses: shed load, add capacity, or fix the client.
+
+**Give queued work a deadline.** `max_queue_wait_seconds` abandons a request
+that has waited too long without being admitted, so capacity goes to work
+someone is still waiting for. This is strictly worse for the client than
+shedding, since the request was accepted first and the stream simply ends, which
+is why the alert on it recommends shedding earlier instead.
+
+**Check the invariant in production, not only in tests.** The block pool
+accounting is verified every step: free plus cached plus used must equal the
+pool. It is a few integer comparisons, and its violation means the allocator has
+leaked or double-counted, so everything measured afterwards is suspect. It fails
+liveness and is exposed as `engine_kv_accounting_ok`.
+
+Nine alert rules ship with the chart, each naming the action it implies rather
+than only the symptom, and `scripts/check_observability.py` fails CI if an alert
+references a metric the server does not expose or omits a severity or a
+description.
+
 ## Lessons recorded
 
 - A missing test fixture must not read as a pass. The per-layer dumps are

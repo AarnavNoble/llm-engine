@@ -61,6 +61,13 @@ SamplingParams parse_params(const json& body) {
   return p;
 }
 
+std::string health_json(const HealthReport& h) {
+  json j{{"alive", h.alive}, {"ready", h.ready},
+         {"seconds_since_progress", h.seconds_since_progress}};
+  if (!h.problems.empty()) j["problems"] = h.problems;
+  return j.dump();
+}
+
 void write_error(httplib::Response& res, int code, const std::string& msg) {
   res.status = code;
   res.set_content(json{{"error", {{"message", msg}, {"type", "invalid_request_error"}}}}.dump(), "application/json");
@@ -72,9 +79,21 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
   auto& svr = *svr_;
   svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
 
-  svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) { res.set_content("ok", "text/plain"); });
+  // Liveness asks "is this process still working, or should it be restarted?".
+  // Answering unconditionally ok, as this used to, makes the probe useless: a
+  // deadlocked step loop or a hung kernel would never be noticed.
+  svr.Get("/healthz", [this](const httplib::Request&, httplib::Response& res) {
+    const HealthReport h = engine_.health();
+    res.set_content(health_json(h), "application/json");
+    if (!h.alive) res.status = 503;
+  });
+  // Readiness asks "should traffic come here?". A draining engine is alive but
+  // unready, which is why these must be separate endpoints.
   svr.Get("/readyz", [this](const httplib::Request&, httplib::Response& res) {
-    if (engine_.ready() && accepting_) res.set_content("ready", "text/plain"); else { res.status = 503; res.set_content("not ready", "text/plain"); }
+    const HealthReport h = engine_.health();
+    const bool ready = h.ready && accepting_;
+    res.set_content(health_json(h), "application/json");
+    if (!ready) res.status = 503;
   });
   svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
     res.set_content(engine_.metrics().render_prometheus(), "text/plain; version=0.0.4");
@@ -112,11 +131,24 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
     auto ch = std::make_shared<Stream>();
     SamplingParams params = parse_params(body);
     if (std::string why = engine_.validate(prompt.size(), params); !why.empty()) {
+      engine_.metrics().requests_rejected_invalid++;
       write_error(res, 400, why);
       return;
     }
-    SequencePtr seq = engine_.submit(prompt, params, [ch](const Sequence&, int32_t t, FinishReason r) { ch->push(t, r); });
-    if (!seq) { write_error(res, 503, "server is draining"); return; }
+    auto sub = engine_.submit(prompt, params, [ch](const Sequence&, int32_t t, FinishReason r) { ch->push(t, r); });
+    if (!sub.ok()) {
+      // 429 for overload and 503 for draining are different instructions to the
+      // client: back off and retry, versus this instance is going away.
+      if (sub.status == SubmitStatus::Overloaded) {
+        res.set_header("Retry-After", std::to_string(sub.retry_after_seconds));
+        write_error(res, 429, sub.reason);
+      } else {
+        engine_.metrics().requests_rejected_draining++;
+        write_error(res, 503, sub.reason);
+      }
+      return;
+    }
+    SequencePtr seq = sub.seq;
     const size_t prompt_tokens = prompt.size();
 
     if (!stream) {

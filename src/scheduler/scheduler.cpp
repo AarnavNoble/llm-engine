@@ -1,6 +1,7 @@
 #include "engine/scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cassert>
 
 namespace engine {
@@ -170,6 +171,23 @@ StepInput Scheduler::schedule() {
   budget -= static_cast<int>(decode.size());
 
   // 4. Admit waiting sequences under the remaining budget (FCFS).
+  // Abandon requests that have waited past their deadline before trying to admit
+  // anything, so capacity goes to work someone is still waiting for.
+  if (cfg_.max_queue_wait_seconds > 0 && !waiting_.empty()) {
+    const auto now = Clock::now();
+    std::vector<SequencePtr> expired;
+    for (auto it = waiting_.begin(); it != waiting_.end();) {
+      const double waited = std::chrono::duration<double>(now - (*it)->t_arrival).count();
+      if (waited > cfg_.max_queue_wait_seconds && (*it)->block_table.empty()) {
+        expired.push_back(*it);
+        it = waiting_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto& s : expired) { stats_.timed_out++; retire(s, FinishReason::Timeout); }
+  }
+
   if (may_admit) {
     for (auto& w : waiting_) w->wait_steps++;
     while (admit_one(step, budget)) {}

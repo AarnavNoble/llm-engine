@@ -24,10 +24,19 @@ struct SamplingParams {
 };
 
 enum class SeqStatus { Waiting, Running, Finished };
-enum class FinishReason { None, Stop, Length, Abort };
+enum class FinishReason { None, Stop, Length, Abort, Timeout };
 
 inline const char* finish_reason_str(FinishReason r) {
-  switch (r) { case FinishReason::Stop: return "stop"; case FinishReason::Length: return "length"; case FinishReason::Abort: return "abort"; default: return ""; }
+  switch (r) {
+    case FinishReason::Stop: return "stop";
+    case FinishReason::Length: return "length";
+    case FinishReason::Abort: return "abort";
+    // OpenAI clients understand a small set of reasons; a request abandoned
+    // because it waited too long is reported as a cancellation, with the
+    // distinction kept in the metrics and the logs.
+    case FinishReason::Timeout: return "abort";
+    default: return "";
+  }
 }
 
 struct Sequence {

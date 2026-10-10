@@ -30,7 +30,11 @@ void usage() {
     "  --max-num-seqs N          running sequences per step (default 32)\n"
     "  --max-batched-tokens N    prefill+decode tokens per step (default 2048)\n"
     "  --chunk N                 prefill chunk size (default 512)\n"
-    "  --seed N\n";
+    "  --seed N\n"
+    "overload protection and failure detection:\n"
+    "  --max-queue-depth N       reject with 429 past this many queued requests (default 256, 0 = off)\n"
+    "  --max-queue-wait SECONDS  abandon a request that waits this long unadmitted (default off)\n"
+    "  --stall-timeout SECONDS   liveness fails if no step completes in this long (default 120)\n";
 }
 
 struct Args {
@@ -65,6 +69,9 @@ bool parse(int argc, char** argv, Args& a) {
     else if (k == "--max-batched-tokens") a.ecfg.sched.max_num_batched_tokens = std::stoi(val());
     else if (k == "--chunk") a.ecfg.sched.prefill_chunk_size = std::stoi(val());
     else if (k == "--seed") a.ecfg.seed = std::stoull(val());
+    else if (k == "--max-queue-depth") a.ecfg.max_queue_depth = std::stoi(val());
+    else if (k == "--max-queue-wait") a.ecfg.sched.max_queue_wait_seconds = std::stod(val());
+    else if (k == "--stall-timeout") a.ecfg.stall_timeout_seconds = std::stod(val());
     else { std::cerr << "unknown option " << k << "\n"; return false; }
   }
   if (a.model.empty()) { std::cerr << "--model is required\n"; return false; }
@@ -87,10 +94,11 @@ int cmd_generate(const Args& a) {
   auto t0 = Clock::now();
   for (int c = 0; c < a.copies; c++) {
     SamplingParams sp; sp.max_tokens = a.max_tokens; sp.temperature = a.temperature; sp.top_p = a.top_p; sp.seed = a.ecfg.seed + c;
-    eng.submit(prompt, sp, [&, c](const Sequence&, int32_t t, FinishReason r) {
+    auto sub = eng.submit(prompt, sp, [&, c](const Sequence&, int32_t t, FinishReason r) {
       if (t >= 0) { out_ids[c].push_back(t); std::string piece = tok.decode_token(t); outputs[c] += piece; if (a.copies == 1) { std::cout << piece << std::flush; } }
       else { std::lock_guard<std::mutex> g(mu); done++; cv.notify_all(); (void)r; }
     });
+    if (!sub.ok()) throw std::runtime_error("submit rejected: " + sub.reason);
   }
   { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&] { return done == a.copies; }); }
   double secs = std::chrono::duration<double>(Clock::now() - t0).count();

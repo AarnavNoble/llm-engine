@@ -1,0 +1,136 @@
+{{- if .Values.metrics.alerts.enabled }}
+# Alerts are written against what the engine can actually distinguish, and each
+# one names the action it implies. An alert without a response is noise, and
+# noise is how real alerts get ignored.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "engine.fullname" . }}
+  labels: {{- include "engine.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: engine.availability
+      rules:
+        # Liveness already restarts a stalled pod; this fires when it happens
+        # often enough to be a pattern rather than a one-off.
+        - alert: EngineStalling
+          expr: |
+            increase(kube_pod_container_status_restarts_total{container="engine"}[30m]) > 2
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "engine restarting repeatedly ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              More than two restarts in 30 minutes. Liveness fails when no step
+              completes while work is queued, so check for a hung kernel or a
+              deadlock before assuming the probe is wrong.
+
+        # The allocator's own accounting disagrees with itself. Nothing measured
+        # after this is trustworthy, so it outranks every latency alert.
+        - alert: EngineKVAccountingBroken
+          expr: engine_kv_accounting_ok == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "KV block accounting invariant violated ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              free + cached + used no longer equals the pool size, which means the
+              block allocator has leaked or double-counted. Capture the pod and
+              restart it; results from this instance are suspect.
+
+    - name: engine.saturation
+      rules:
+        # Shedding is the correct response to overload, so a little is healthy.
+        # Sustained shedding means capacity, not behaviour, is the problem.
+        - alert: EngineSheddingLoad
+          expr: |
+            sum(rate(engine_requests_rejected_overload_total[5m])) by (pod)
+              / clamp_min(sum(rate(engine_requests_total[5m])) by (pod), 0.001) > 0.05
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "engine rejecting over 5% of requests ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              The queue is full often enough to turn away real traffic. Raise
+              replicas or max_num_seqs; raising max_queue_depth alone only moves
+              the latency, it does not add capacity.
+
+        - alert: EngineQueueBacklog
+          expr: avg(engine_queue_depth) by (pod) > {{ .Values.metrics.alerts.queueDepthWarning }}
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "queue depth above {{ .Values.metrics.alerts.queueDepthWarning }} ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              Arrivals are outpacing service. This is the same signal KEDA scales
+              on, so if it persists the autoscaler is at its ceiling or blocked.
+
+        # Preemption is recompute, so this alert is about wasted capacity rather
+        # than correctness: the work is being done twice.
+        - alert: EnginePreemptionThrash
+          expr: |
+            sum(rate(engine_recomputed_tokens_total[10m])) by (pod)
+              / clamp_min(sum(rate(engine_generated_tokens_total[10m])) by (pod), 0.001) > 0.2
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "over 20% of token work is recompute ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              KV memory is oversubscribed and sequences are being evicted and
+              recomputed. Lower max_num_seqs or raise num_blocks. The admission
+              watermark limits this; hitting it anyway means the pool is too small
+              for the concurrency being asked of it.
+
+        - alert: EngineKVExhausted
+          expr: |
+            avg(engine_kv_blocks_free + engine_kv_blocks_cached) by (pod)
+              / clamp_min(avg(engine_kv_blocks_total) by (pod), 1) < 0.05
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "under 5% of KV blocks available ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              Almost all blocks are held by running sequences. Preemption is
+              imminent if it is not already happening.
+
+    - name: engine.latency
+      rules:
+        - alert: EngineHighTTFT
+          expr: |
+            histogram_quantile(0.95, sum(rate(engine_ttft_seconds_bucket[10m])) by (le, pod))
+              > {{ .Values.metrics.alerts.ttftP95Seconds }}
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "TTFT p95 above {{ .Values.metrics.alerts.ttftP95Seconds }}s ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              Prefill latency as clients see it. Read it with engine_queue_depth:
+              with a backlog this is queueing, without one it is prompt length or
+              the prefix cache missing.
+
+        - alert: EngineHighInterTokenLatency
+          expr: |
+            histogram_quantile(0.95, sum(rate(engine_inter_token_seconds_bucket[10m])) by (le, pod))
+              > {{ .Values.metrics.alerts.interTokenP95Seconds }}
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "inter-token p95 above {{ .Values.metrics.alerts.interTokenP95Seconds }}s ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              Perceived generation speed. A step that grew without the batch
+              growing points at long contexts or at chunked prefill being
+              disabled.
+
+        # The engine accepted work and then abandoned it, which clients see as a
+        # cancelled stream. Distinct from shedding, which they can retry.
+        - alert: EngineAbandoningRequests
+          expr: sum(rate(engine_requests_timed_out_total[10m])) by (pod) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "requests expiring in the queue ({{ `{{ $labels.pod }}` }})"
+            description: >-
+              Requests are waiting past max_queue_wait and being dropped after
+              acceptance. Prefer shedding earlier (lower max_queue_depth) so
+              clients get a 429 they can retry instead of a cancellation.
+{{- end }}

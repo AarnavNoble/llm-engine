@@ -13,6 +13,11 @@ modelPath: /models/Qwen2.5-0.5B-Instruct
 # Engine flags. Defaults mirror src/main.cpp; override per cluster.
 engine:
   mode: continuous      # continuous | static
+  # Overload protection. Rejecting past a bounded queue keeps latency finite;
+  # accepting without limit only spreads the delay across every request.
+  maxQueueDepth: 256
+  maxQueueWaitSeconds: 0    # 0 = never abandon a queued request
+  stallTimeoutSeconds: 120  # liveness fails if no step completes while work is queued
   numBlocks: 4096       # 4096 * 16 = 65536 KV token slots
   blockSize: 16
   prefixCaching: true
@@ -79,6 +84,13 @@ metrics:
   serviceMonitor:
     enabled: false
     interval: 15s
+  # Alert thresholds. Defaults suit a 0.5B model on one GPU; they are deliberately
+  # loose, because an alert that fires routinely is an alert nobody reads.
+  alerts:
+    enabled: false
+    queueDepthWarning: 32
+    ttftP95Seconds: 5
+    interTokenP95Seconds: 0.5
 
 # Autoscale on queue depth, not CPU: a GPU pod is saturated long before its CPU is.
 keda:

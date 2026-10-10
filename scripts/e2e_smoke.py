@@ -53,7 +53,8 @@ def main(a):
     port = a.port or free_port()
     base = f"http://127.0.0.1:{port}"
     cmd = [a.binary, "serve", "--model", a.model, "--backend", a.backend,
-           "--host", "127.0.0.1", "--port", str(port), "--num-blocks", str(a.num_blocks)]
+           "--host", "127.0.0.1", "--port", str(port), "--num-blocks", str(a.num_blocks),
+           "--max-queue-depth", str(a.max_queue_depth)]
     print("$", " ".join(cmd))
     log = open(a.log, "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
@@ -71,7 +72,13 @@ def main(a):
                 time.sleep(0.5)
         else:
             sys.exit(f"server never became ready; see {a.log}")
-        check("GET /healthz", get(base + "/healthz")[0] == 200)
+        # Liveness must report real state, not a constant. A probe that cannot
+        # fail never restarts a wedged process.
+        code, body = get(base + "/healthz")
+        health = json.loads(body)
+        check("GET /healthz reports structured health", code == 200 and health["alive"] is True, body)
+        check("/healthz exposes progress age", "seconds_since_progress" in health, body)
+        check("an idle engine is not reported as stalled", health["alive"] and health["ready"], body)
         check("GET /v1/models lists the loaded model",
               a.model in get(base + "/v1/models")[1])
 
@@ -164,15 +171,50 @@ def main(a):
         check("max_tokens of zero is rejected with 400",
               post_status(base + "/v1/completions", {"prompt": "hi", "max_tokens": 0}) == 400)
 
+        print("\noverload protection")
+        # A bounded queue is what keeps latency finite under a flood. Verify the
+        # shed path end to end, including the header a client needs to back off.
+        flood = {"prompt_token_ids": list(range(1000, 1200)), "max_tokens": 64,
+                 "temperature": 0, "ignore_eos": True}
+
+        # Capture the status and the Retry-After header in the same request. A
+        # follow-up probe after the flood would race: the queue drains, the probe
+        # is accepted, and the header it was looking for never existed.
+        def flood_one(_):
+            req = urllib.request.Request(base + "/v1/completions", data=json.dumps(flood).encode(),
+                                         headers={"content-type": "application/json"})
+            try:
+                return urllib.request.urlopen(req, timeout=300).status, None
+            except urllib.error.HTTPError as e:
+                return e.code, e.headers.get("Retry-After")
+
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=24) as pool:
+            outcomes = list(pool.map(flood_one, range(24)))
+        codes = [c for c, _ in outcomes]
+        shed = [h for c, h in outcomes if c == 429]
+        check("a flood is partly shed rather than all queued", len(shed) > 0,
+              f"codes: {sorted(set(codes))}")
+        check("every shed request carries Retry-After", shed and all(h is not None for h in shed),
+              f"headers: {set(shed)}")
+        check("accepted requests still succeed during a flood", any(c == 200 for c in codes),
+              f"codes: {sorted(set(codes))}")
+        check("shedding is counted",
+              "engine_requests_rejected_overload_total" in get(base + "/metrics")[1])
+
         print("\nmetrics")
         status, metrics = get(base + "/metrics")
         check("GET /metrics returns Prometheus text", status == 200 and "# TYPE" in metrics)
         for name in ("engine_requests_total", "engine_generated_tokens_total", "engine_queue_depth",
                      "engine_kv_blocks_used", "engine_kv_waste_fraction", "engine_ttft_seconds_count",
-                     "engine_inter_token_seconds_count", "engine_prefix_cache_hit_blocks_total"):
+                     "engine_inter_token_seconds_count", "engine_prefix_cache_hit_blocks_total",
+                     "engine_recomputed_tokens_total", "engine_kv_accounting_ok",
+                     "engine_requests_rejected_overload_total", "engine_requests_timed_out_total"):
             check(f"exposes {name}", f"\n{name} " in metrics or f"\n{name}_bucket" in metrics)
         served = [l for l in metrics.splitlines() if l.startswith("engine_requests_total ")]
         check("request counter advanced", served and int(float(served[0].split()[1])) >= 8, str(served))
+        check("the allocator's own accounting is sound",
+              "\nengine_kv_accounting_ok 1\n" in metrics)
         check("all KV blocks returned to the pool after idle",
               "\nengine_kv_blocks_used 0\n" in metrics,
               [l for l in metrics.splitlines() if l.startswith("engine_kv_blocks_used")])
@@ -261,6 +303,7 @@ if __name__ == "__main__":
     ap.add_argument("--backend", default="cpu")
     ap.add_argument("--port", type=int, default=0, help="0 picks a free port")
     ap.add_argument("--num-blocks", type=int, default=256)
+    ap.add_argument("--max-queue-depth", type=int, default=8)
     ap.add_argument("--drain-tokens", type=int, default=256,
                     help="length of the request held in flight across SIGTERM; raise it if the "
                          "backend is fast enough to drain before the probes run")

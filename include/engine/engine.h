@@ -27,6 +27,42 @@ struct EngineConfig {
   bool prefix_caching = true;
   SchedulerConfig sched;
   uint64_t seed = 42;
+
+  // --- overload protection ---
+  // Accepting work without limit does not make it finish any sooner: if arrivals
+  // outpace service, the queue and every request's latency grow without bound.
+  // Past this many queued requests the engine rejects new ones so clients can
+  // retry or fail fast instead of all waiting. 0 disables the limit.
+  int max_queue_depth = 256;
+
+  // --- failure detection ---
+  // If work is pending and no step completes within this long, the engine is
+  // considered stalled and liveness fails, so an orchestrator restarts it. Must
+  // comfortably exceed the slowest single forward pass. 0 disables the check.
+  double stall_timeout_seconds = 120.0;
+};
+
+// Why a request was not accepted. The API maps these to status codes; they are
+// separated because they mean different things to a client: retry later,
+// go away, or fix the request.
+enum class SubmitStatus { Accepted, Draining, Overloaded, Invalid };
+
+struct SubmitResult {
+  SubmitStatus status = SubmitStatus::Accepted;
+  SequencePtr seq;              // only when accepted
+  std::string reason;           // client-facing, empty when accepted
+  int retry_after_seconds = 0;  // advisory, set when overloaded
+  bool ok() const { return status == SubmitStatus::Accepted; }
+};
+
+// Result of the engine's self-check. Liveness and readiness ask different
+// questions of it: a draining engine is unready but perfectly alive, while a
+// stalled one is the opposite and must be restarted rather than waited for.
+struct HealthReport {
+  bool alive = true;      // the step loop is running and making progress
+  bool ready = true;      // alive, loaded, and accepting work
+  std::vector<std::string> problems;
+  double seconds_since_progress = 0;
 };
 
 class Engine {
@@ -39,11 +75,12 @@ class Engine {
   void drain();    // stop accepting, finish in-flight, then stop (SIGTERM path)
 
   using TokenCallback = std::function<void(const Sequence&, int32_t token, FinishReason)>;
+  HealthReport health() const;
   // Empty when the request can run; otherwise a client-facing reason why it
   // never could, so the API can reject it instead of accepting work that is
   // guaranteed to be aborted partway through.
   std::string validate(size_t prompt_tokens, const SamplingParams& params) const;
-  SequencePtr submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb);
+  SubmitResult submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb);
   void abort(uint64_t id);
   bool accepting() const { return accepting_; }
 
@@ -74,6 +111,13 @@ class Engine {
   std::vector<uint64_t> abort_inbox_;
   std::atomic<bool> running_{false}, accepting_{false}, ready_{false}, draining_{false};
   std::atomic<uint64_t> next_id_{1};
+  // Progress watchdog. The engine thread stamps this after every completed step
+  // and whenever it goes idle with nothing to do, so a stalled loop is
+  // distinguishable from an idle one.
+  std::atomic<int64_t> last_progress_us_{0};
+  std::atomic<bool> invariants_ok_{true};
+  std::atomic<int64_t> queued_{0};
+  void mark_progress();
 };
 
 }  // namespace engine

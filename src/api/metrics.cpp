@@ -35,6 +35,11 @@ std::string Metrics::render_prometheus() const {
   counter("engine_requests_total", "Requests accepted", requests_total);
   counter("engine_requests_finished_total", "Requests finished", requests_finished);
   counter("engine_requests_aborted_total", "Requests aborted", requests_aborted);
+  counter("engine_requests_timed_out_total", "Requests abandoned after waiting past their deadline", requests_timed_out);
+  counter("engine_requests_queue_timeout_total", "Queue deadline expiries seen by the scheduler", requests_queue_timeout_total);
+  counter("engine_requests_rejected_overload_total", "Requests rejected because the queue was full", requests_rejected_overload);
+  counter("engine_requests_rejected_invalid_total", "Requests rejected as malformed or impossible", requests_rejected_invalid);
+  counter("engine_requests_rejected_draining_total", "Requests rejected because the server was draining", requests_rejected_draining);
   counter("engine_prompt_tokens_total", "Prompt tokens received", prompt_tokens_total);
   counter("engine_generated_tokens_total", "Tokens generated", generated_tokens_total);
   counter("engine_steps_total", "Forward passes executed", steps_total);
@@ -52,6 +57,7 @@ std::string Metrics::render_prometheus() const {
   gauge("engine_kv_blocks_cached", "Unowned KV blocks retained for prefix reuse", static_cast<double>(kv_blocks_cached));
   gauge("engine_kv_waste_fraction", "Allocated-but-empty KV slots / allocated slots", kv_waste_fraction);
   gauge("engine_tokens_per_second", "Generated tokens per second (moving)", tokens_per_second);
+  gauge("engine_kv_accounting_ok", "1 while free + cached + used equals the pool size", static_cast<double>(kv_accounting_ok));
   o << ttft.render("engine_ttft_seconds", "Time to first token");
   o << inter_token.render("engine_inter_token_seconds", "Inter-token latency");
   o << e2e.render("engine_request_seconds", "End-to-end request latency");

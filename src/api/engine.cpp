@@ -95,8 +95,65 @@ std::string Engine::validate(size_t prompt_tokens, const SamplingParams& params)
   return "";
 }
 
-SequencePtr Engine::submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb) {
-  if (!accepting_) return nullptr;
+void Engine::mark_progress() {
+  last_progress_us_ = std::chrono::duration_cast<std::chrono::microseconds>(
+      Clock::now().time_since_epoch()).count();
+}
+
+HealthReport Engine::health() const {
+  HealthReport h;
+  const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      Clock::now().time_since_epoch()).count();
+  const int64_t last = last_progress_us_.load();
+  h.seconds_since_progress = last == 0 ? 0.0 : (now_us - last) / 1e6;
+
+  if (!ready_) { h.alive = false; h.problems.push_back("model not loaded"); }
+  if (!running_) {
+    // Not running is fatal while serving, but is also the state before start()
+    // and after a completed drain, so it is reported rather than interpreted.
+    h.alive = false;
+    h.problems.push_back("engine loop not running");
+  }
+  // A stall means work is pending and the loop is not advancing it. An engine
+  // with an empty queue is healthy however long it has been quiet, and that
+  // distinction has to come from a counter both threads update rather than from
+  // elapsed time: the loop sleeps on a condition variable when idle, so "no
+  // recent step" is the normal state of a healthy, unused server. Reporting
+  // that as dead would crash-loop an idle pod.
+  if (cfg_.stall_timeout_seconds > 0 && last != 0 && queued_.load() > 0 &&
+      h.seconds_since_progress > cfg_.stall_timeout_seconds) {
+    h.alive = false;
+    h.problems.push_back("no step completed in " + std::to_string(h.seconds_since_progress) + "s");
+  }
+  if (!invariants_ok_) {
+    // The block pool accounting does not add up, which means the allocator has
+    // leaked or double-counted. Results past this point are not trustworthy.
+    h.alive = false;
+    h.problems.push_back("KV block accounting invariant violated");
+  }
+  h.ready = h.alive && accepting_;
+  if (h.alive && !accepting_) h.problems.push_back("draining");
+  return h;
+}
+
+SubmitResult Engine::submit(std::vector<int32_t> prompt, SamplingParams params, TokenCallback cb) {
+  SubmitResult out;
+  if (!accepting_) {
+    out.status = SubmitStatus::Draining;
+    out.reason = "server is draining";
+    return out;
+  }
+  // Load shedding. Rejecting early is kinder than accepting work that cannot be
+  // served in time: the client learns immediately and can retry or shed its own
+  // load, instead of every request in flight getting slower.
+  if (cfg_.max_queue_depth > 0 && queued_.load() >= cfg_.max_queue_depth) {
+    out.status = SubmitStatus::Overloaded;
+    out.reason = "too many queued requests (" + std::to_string(queued_.load()) + " of " +
+                 std::to_string(cfg_.max_queue_depth) + "); retry shortly";
+    out.retry_after_seconds = 1;
+    metrics_.requests_rejected_overload++;
+    return out;
+  }
   auto s = std::make_shared<Sequence>();
   s->id = next_id_++;
   s->tokens = std::move(prompt);
@@ -111,8 +168,10 @@ SequencePtr Engine::submit(std::vector<int32_t> prompt, SamplingParams params, T
     std::lock_guard<std::mutex> g(inbox_mu_);
     inbox_.push_back(s);
   }
+  queued_++;
   inbox_cv_.notify_one();
-  return s;
+  out.seq = s;
+  return out;
 }
 
 void Engine::abort(uint64_t id) {
@@ -129,6 +188,13 @@ void Engine::refresh_gauges() {
   metrics_.kv_waste_fraction = scheduler_.kv_waste_fraction();
   metrics_.steps_total = scheduler_.stats().steps;
   metrics_.preemptions_total = scheduler_.stats().preemptions;
+  metrics_.requests_queue_timeout_total = scheduler_.stats().timed_out;
+  // Cheap enough to check every step, and the one invariant whose violation
+  // invalidates everything downstream.
+  const bool balanced = kv_.num_free_blocks() + kv_.num_cached_blocks() + kv_.num_used_blocks() ==
+                        kv_.num_total_blocks();
+  if (!balanced) invariants_ok_ = false;
+  metrics_.kv_accounting_ok = balanced ? 1 : 0;
   metrics_.recomputed_tokens_total = scheduler_.stats().recomputed_tokens;
   metrics_.prefix_cache_queries = kv_.stats().prefix_queries;
   metrics_.prefix_cache_hit_blocks = kv_.stats().prefix_hit_blocks;
@@ -137,6 +203,7 @@ void Engine::refresh_gauges() {
 }
 
 void Engine::run() {
+  mark_progress();
   std::vector<float> logits;
   const int vocab = model_->config().vocab_size;
   auto window_start = Clock::now(); uint64_t window_tokens = 0;
@@ -147,8 +214,20 @@ void Engine::run() {
       std::unique_lock<std::mutex> lk(inbox_mu_);
       if (!scheduler_.has_work() && inbox_.empty() && abort_inbox_.empty()) {
         if (draining_) break;
-        inbox_cv_.wait(lk, [&] { return !running_ || draining_ || !inbox_.empty() || !abort_inbox_.empty(); });
+        // Bounded wait rather than an indefinite one, so an idle loop keeps
+        // stamping progress and seconds_since_progress stays a real measure of
+        // whether the loop is turning.
+        mark_progress();
+        inbox_cv_.wait_for(lk, std::chrono::milliseconds(500), [&] {
+          return !running_ || draining_ || !inbox_.empty() || !abort_inbox_.empty();
+        });
         if (!running_) break;
+        if (inbox_.empty() && abort_inbox_.empty() && !scheduler_.has_work()) {
+          mark_progress();
+          lk.unlock();
+          refresh_gauges();
+          continue;
+        }
       }
       for (auto& s : inbox_) {
         // Wrap the user callback so we can record timings + metrics centrally.
@@ -159,8 +238,11 @@ void Engine::run() {
             if (seq.num_generated() == 1) metrics_.ttft.observe(std::chrono::duration<double>(seq.t_first_token - seq.t_arrival).count());
             else if (seq.token_times.size() >= 2) metrics_.inter_token.observe(std::chrono::duration<double>(seq.token_times.back() - seq.token_times[seq.token_times.size() - 2]).count());
           } else {
-            if (r == FinishReason::Abort) metrics_.requests_aborted++; else metrics_.requests_finished++;
+            if (r == FinishReason::Timeout) metrics_.requests_timed_out++;
+            else if (r == FinishReason::Abort) metrics_.requests_aborted++;
+            else metrics_.requests_finished++;
             metrics_.e2e.observe(std::chrono::duration<double>(Clock::now() - seq.t_arrival).count());
+            queued_--;
           }
           if (user_cb) user_cb(seq, tok, r);
         };
@@ -170,15 +252,18 @@ void Engine::run() {
       for (uint64_t id : abort_inbox_) scheduler_.abort(id);
       abort_inbox_.clear();
     }
-    if (!scheduler_.has_work()) { refresh_gauges(); continue; }
+    // An idle loop is healthy, so it counts as progress; only a loop with work
+    // that fails to advance is a stall.
+    if (!scheduler_.has_work()) { mark_progress(); refresh_gauges(); continue; }
 
     auto t0 = Clock::now();
     StepInput step = scheduler_.schedule();
-    if (step.empty()) { refresh_gauges(); if (!scheduler_.has_work()) continue; std::this_thread::yield(); continue; }
+    if (step.empty()) { refresh_gauges(); if (!scheduler_.has_work()) { mark_progress(); continue; } std::this_thread::yield(); continue; }
     model_->forward(step, logits);
     auto sampled = sampler_.sample_step(step, logits, vocab);
     scheduler_.on_step_done(step, sampled);
     auto t1 = Clock::now();
+    mark_progress();
     metrics_.step_time.observe(std::chrono::duration<double>(t1 - t0).count());
     metrics_.batch_tokens.observe(step.num_tokens());
     window_tokens += sampled.size();

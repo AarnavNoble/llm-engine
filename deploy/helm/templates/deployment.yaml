@@ -73,6 +73,12 @@ spec:
             - {{ .Values.engine.maxBatchedTokens | quote }}
             - --chunk
             - {{ .Values.engine.prefillChunk | quote }}
+            - --max-queue-depth
+            - {{ .Values.engine.maxQueueDepth | quote }}
+            - --max-queue-wait
+            - {{ .Values.engine.maxQueueWaitSeconds | quote }}
+            - --stall-timeout
+            - {{ .Values.engine.stallTimeoutSeconds | quote }}
             {{- if not .Values.engine.prefixCaching }}
             - --no-prefix-cache
             {{- end }}

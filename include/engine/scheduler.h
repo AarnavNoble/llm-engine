@@ -33,6 +33,10 @@ struct SchedulerConfig {
   // fits. Lookahead 0 or 1 is strict FCFS and the bound never applies.
   int admission_lookahead = 1;
   int starvation_wait_steps = 64;
+  // A request that has waited this long without being admitted is abandoned.
+  // Without it an overloaded engine holds work nobody is waiting for any more,
+  // and the queue only ever grows. 0 disables the deadline.
+  double max_queue_wait_seconds = 0;
   // Admission watermark: free blocks that must remain after admitting a new
   // sequence. The engine admits optimistically and preempts reactively, so
   // without headroom a fresh admission steals the block a resident sequence
@@ -43,7 +47,7 @@ struct SchedulerConfig {
 };
 
 struct SchedulerStats {
-  uint64_t steps = 0, preemptions = 0, admitted = 0, finished = 0;
+  uint64_t steps = 0, preemptions = 0, admitted = 0, finished = 0, timed_out = 0;
   // Tokens whose K/V were computed, then discarded by a preemption and have to
   // be computed again. This is the price of recompute-on-resume, and without it
   // the preemption counter says how often it happened but not what it cost.

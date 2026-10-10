@@ -81,6 +81,8 @@ The tokenizer is checked token-for-token against `tokenizers` on a 75-line corpu
 - **API** (`api/`): `/v1/completions`, `/v1/chat/completions` (ChatML template), SSE streaming with UTF-8-safe chunking, `prompt_token_ids` for benchmarks, `ignore_eos`, per-request `seed`.
 - **Observability**: Prometheus counters, gauges and histograms — queue depth, running sequences, KV blocks free/used/cached, prefix hit ratio, tokens/s, TTFT, inter-token latency, step time, preemptions.
 - **Graceful drain**: SIGTERM flips `/readyz` to 503, finishes in-flight sequences, then exits.
+- **Failure detection**: `/healthz` reports real state and fails when the step loop stalls with work queued, when weights are not loaded, or when the allocator's own block accounting stops adding up — a liveness probe that cannot fail never restarts a wedged process. An idle engine is explicitly not a stalled one.
+- **Overload protection**: past `--max-queue-depth` the server returns 429 with `Retry-After` instead of queueing without limit, because unbounded acceptance only spreads the delay over every request. Queued work can be given a deadline, rejections are counted by cause, and nine Prometheus alert rules ship with the chart, each naming the action it implies.
 
 ## Scope, honestly
 
