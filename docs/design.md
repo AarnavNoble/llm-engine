@@ -155,6 +155,28 @@ did not cover:
   outright, which is both correct and cheaper, since its K/V will never be read
   again.
 
+## Concurrency
+
+Only the Engine is multi-threaded. The scheduler, allocator and model are owned
+by the engine thread and never touched from outside it; requests and aborts
+cross the boundary through a mutex-protected inbox, and token callbacks run on
+the engine thread. Metrics are the one shared structure, which is why counters
+are atomic and histograms carry a mutex.
+
+`tests/test_engine_concurrency.cpp` exercises that boundary: six threads
+submitting randomised requests while a seventh aborts a scattering of them
+mid-flight, then checks that every request reaches exactly one terminal state,
+that the metrics agree with what the callbacks saw, and that the block pool is
+empty afterwards. A second case drains while work is in flight and requires that
+in-flight requests finish rather than abort, and that submissions during the
+drain are refused rather than silently dropped.
+
+These tests assert outcomes, not the absence of races. ThreadSanitizer would
+assert the latter, but it segfaults on a two-thread hello world on this machine
+(macOS 26, arm64), and the Address/UB build hangs during configuration. Running
+both sanitizers is therefore a step in `docs/gpu-setup.md`, to be done on the
+Linux GPU box, rather than something quietly skipped.
+
 ## Lessons recorded
 
 - A missing test fixture must not read as a pass. The per-layer dumps are

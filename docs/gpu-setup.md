@@ -28,6 +28,17 @@ Rules: stop the pod whenever you walk away; keep everything on the persistent vo
    nsys profile -o docs/prof/decode ./build/engine generate --backend cuda --model models/Qwen2.5-0.5B-Instruct --prompt "hi" --max-tokens 64
    ncu --set full -k regex:attention_decode -c 3 ./build/engine generate --backend cuda --model models/Qwen2.5-0.5B-Instruct --prompt "hi" --max-tokens 8
    ```
-7. **Budget**: ~40 GPU-hours total. `runpodctl stop pod <id>` (or the web button) every time.
+7. **Sanitizers.** Run these once on the Linux box, because they do not work on
+   the Mac: ThreadSanitizer segfaults on a two-thread hello world under macOS 26
+   on arm64, and the Address/UB build hangs during configuration. The Engine is
+   the only multi-threaded component (HTTP threads submit and abort, the engine
+   thread owns the scheduler and fires callbacks), so it is worth a clean run:
+   ```bash
+   cmake -S . -B build-tsan -G Ninja -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
+     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+   cmake --build build-tsan && ./build-tsan/tests/engine_tests "[model]"
+   # and again with -fsanitize=address,undefined
+   ```
+8. **Budget**: ~40 GPU-hours total. `runpodctl stop pod <id>` (or the web button) every time.
 
 Colab fallback: T4 is sm_75 — build with `-DCMAKE_CUDA_ARCHITECTURES=75`; no bf16, so fp16 only. Fine for the first kernels, not for the published numbers.
