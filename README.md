@@ -14,18 +14,46 @@ Full tables, the protocol, and what each figure does and does not mean: **[docs/
 
 Reproduce everything on one machine with `scripts/reproduce.sh` (add `--quick` for a smoke check, which writes to a separate directory and leaves the published numbers alone).
 
-Measured so far, all on a 10-core Mac with the CPU backend except the first row, which is hardware independent:
+Each row names the machine it was measured on, because they differ. Full
+tables, with the protocol and what each figure does and does not mean, are in
+[docs/results.md](docs/results.md).
 
-| Result | Number |
-|---|---|
-| KV slot utilization, paged vs contiguous with a declared cap | **98.8%** vs 55.5% (1.7% reserving full context) |
-| Continuous vs static batching, throughput | **1.47x** |
-| Continuous vs static batching, TTFT p50 | **5.9x faster** (13,673 ms to 2,330 ms) |
-| Prefix caching, TTFT p50 on a shared 512-token prompt | **2.8x faster**, 77.5% block hit ratio (the ceiling for that workload) |
-| Chunked prefill, worst decode stall with a 2,048-token prompt injected | **11.8x smaller** (23.2 s to 2.0 s) |
-| Admission watermark, preemption recompute waste | **16.2% to 2.3%** of all token work, at 0.7% occupancy cost |
+| Result | Number | Measured on |
+|---|---|---|
+| KV slot utilization, paged vs contiguous with a declared cap | **98.8%** vs 55.5% (1.7% reserving full context) | hardware independent |
+| Continuous vs static batching, TTFT p50 | **38x faster** (5,952 ms to 157 ms) | A40, CUDA |
+| Continuous vs static batching, TTFT p95 | **79x faster** (12,896 ms to 163 ms) | A40, CUDA |
+| Continuous vs static batching, throughput | **1.18x** (327 to 386 tok/s) | A40, CUDA |
+| Continuous vs static batching, inter-token p50 | **1.9x worse** (43.2 ms to 80.3 ms) | A40, CUDA |
+| Prefix caching, TTFT p50 on a shared 512-token prompt | **14.4x faster** (1,627 ms to 113 ms), 95.8% block hit ratio | A40, CUDA |
+| Chunked prefill, worst decode stall with a 2,048-token prompt injected | 47.8 ms to **36.8 ms** | A40, CUDA |
+| Continuous vs static batching, throughput | **1.47x** | 10-core Mac, CPU |
+| Chunked prefill, worst decode stall, same experiment | **11.8x smaller** (23.2 s to 2.0 s) | 10-core Mac, CPU |
+| Admission watermark, preemption recompute waste | **16.2% to 2.3%** of all token work, at 0.7% occupancy cost | hardware independent |
 
-GPU throughput, per-kernel Nsight bandwidth, and a vLLM reference row on the same hardware are the remaining rows; `bench/vllm_baseline.py` and the harness are ready for them.
+Three of these are worth reading twice, because they are not the result the
+design predicted.
+
+**Continuous batching barely moves throughput here, and transforms latency.**
+At 32 concurrent requests with a 0.5B model the A40 is already saturated, so
+there is no idle capacity for better scheduling to reclaim; what it buys is
+admitting a request on the next step rather than after the batch drains. The
+same code on the CPU backend, which is not saturated, shows 1.47x. Same engine,
+different bottleneck.
+
+**It makes inter-token latency 1.9x worse,** because every resident sequence
+advances on every step. That is the trade, and it is in the table rather than
+omitted from it.
+
+**Chunked prefill is nearly pointless on this hardware.** It was worth 11.8x on
+the CPU backend and is worth 1.3x here, for the same reason: a 2,048-token
+prefill takes about 37 ms on an A40, so there is barely a stall left to
+subtract. It would matter again with a larger model or longer prompts.
+
+Per-kernel bandwidth against the card's peak, a vLLM reference row, and the
+optimisation rows are not measured. They are rendered as *not measured* on the
+results page rather than estimated, and `bench/report.py` fails rather than
+publishing a figure with no data behind it.
 
 ## Architecture
 
