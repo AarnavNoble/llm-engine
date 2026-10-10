@@ -1,5 +1,7 @@
 # engine — an LLM inference server, written from scratch
 
+[![ci](https://github.com/AarnavNoble/llm-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AarnavNoble/llm-engine/actions/workflows/ci.yml) **899,082 assertions across 81 test cases**, two model architectures, CPU and CUDA backends. [Measured results](https://aarnavnoble.github.io/llm-engine/).
+
 A serving engine for Llama-architecture models (Qwen2.5-0.5B, TinyLlama) with the parts production engines are built from: a **paged KV cache** with block tables, **continuous batching** with chunked prefill and preemption, **prefix caching** with refcounted block sharing, an **OpenAI-compatible streaming API**, Prometheus metrics, and a Kubernetes deploy that scales on queue depth. No PyTorch at runtime: weights are read from safetensors, the tokenizer parses `tokenizer.json` directly, and the forward pass is C++.
 
 **Status.** The CPU backend is complete and verified layer by layer against PyTorch on two architectures; it serves real requests over the API. The CUDA backend runs: the forward pass is device-resident, with hand-written kernels for embedding, RMSNorm, RoPE, the K/V cache write, silu·up, the residual and bias adds, and paged decode attention, plus cuBLAS for the GEMMs. It is gated against the CPU oracle by `tests/test_cuda_model.cpp`, including a case that deliberately fragments the block table so a kernel computing slots arithmetically cannot pass.

@@ -33,6 +33,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -242,6 +244,51 @@ TEST_CASE("cuda model: prefix caching does not change the output", "[cuda][model
   RunOpts off; off.prefix_cache = false;
   RunOpts on;  on.prefix_cache = true;
   require_same(greedy_run(dir, prompts, off), greedy_run(dir, prompts, on));
+}
+
+
+TEST_CASE("cuda model: destroying a model returns its device memory", "[cuda][model][slow]") {
+  // Written because this leaked and 899k assertions did not notice.
+  //
+  // ~CudaModel() released the cuBLAS handle and nothing else: weights, the
+  // rotation tables, the per-layer KV cache and every Scratch buffer stayed
+  // resident, and Scratch had no destructor either. Nothing in the suite
+  // looked at device memory, so the only symptom was a cudaMalloc failure on
+  // a smaller card, reported as the KV pool being too large for the device --
+  // an error that blames the configuration for a leak.
+  //
+  // The reporting hid it too: the allocation counter was a file-scope total
+  // that only incremented, so three models in one process logged 998, 2011
+  // and 3010 MiB and read like one large model rather than three live ones.
+  //
+  // This asserts the property that was missing rather than re-testing the
+  // fix: construct and destroy repeatedly, and require device-free memory to
+  // come back. A tolerance well under one model's footprint catches a whole
+  // leaked model while ignoring driver-side bookkeeping.
+  const std::string dir = ENGINE_MODEL_DIR;
+  if (!std::filesystem::exists(dir + "/config.json")) SKIP("no model");
+
+  auto free_mib = []() {
+    size_t f = 0, t = 0;
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaMemGetInfo(&f, &t) == cudaSuccess);
+    return static_cast<long long>(f >> 20);
+  };
+
+  // One construction first, discarded. It pays for CUDA context creation and
+  // any one-off driver allocation, neither of which a later destructor
+  // returns, and both of which would otherwise look like the leak.
+  { KVCacheManager kv(256, 16, false); auto m = make_cuda_model(dir, kv); }
+  const long long base = free_mib();
+
+  for (int i = 0; i < 3; i++) {
+    { KVCacheManager kv(256, 16, false); auto m = make_cuda_model(dir, kv); }
+    const long long now = free_mib();
+    INFO("after destroying model " << i + 1 << ": " << now << " MiB free, baseline " << base);
+    // Qwen2.5-0.5B is roughly 1 GiB of weights plus its cache, so 256 MiB is
+    // far below one leaked model and far above driver noise.
+    CHECK(base - now < 256);
+  }
 }
 
 #endif  // ENGINE_CUDA
