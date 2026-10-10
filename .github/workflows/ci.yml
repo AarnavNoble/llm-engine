@@ -48,6 +48,11 @@ jobs:
       # references are checked against src/api/metrics.cpp on every push.
       - name: observability references
         run: python3 scripts/check_observability.py
+      # Prose drifts from data silently. Every headline figure quoted in the
+      # README, the benchmarks doc and the write-up is checked against the JSON
+      # the harness produced.
+      - name: published figures match the measurements
+        run: python3 scripts/check_numbers.py
       - name: cpu deployment must not tolerate the GPU taint
         run: |
           if helm template eng deploy/helm --set gpu.enabled=false | grep -qE 'tolerations|nvidia'; then

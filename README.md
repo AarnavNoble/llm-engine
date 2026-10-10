@@ -19,7 +19,7 @@ Measured so far, all on a 10-core Mac with the CPU backend except the first row,
 | Continuous vs static batching, TTFT p50 | **5.9x faster** (13,673 ms to 2,330 ms) |
 | Prefix caching, TTFT p50 on a shared 512-token prompt | **2.8x faster**, 77.5% block hit ratio (the ceiling for that workload) |
 | Chunked prefill, worst decode stall with a 2,048-token prompt injected | **11.8x smaller** (23.2 s to 2.0 s) |
-| Admission watermark, preemption recompute waste | **16.9% to 3.2%** of all token work, at 0.7% occupancy cost |
+| Admission watermark, preemption recompute waste | **16.2% to 2.3%** of all token work, at 0.7% occupancy cost |
 
 GPU throughput, per-kernel Nsight bandwidth, and a vLLM reference row on the same hardware are the remaining rows; `bench/vllm_baseline.py` and the harness are ready for them.
 
@@ -75,7 +75,7 @@ The tokenizer is checked token-for-token against `tokenizers` on a 75-line corpu
 
 - **Paged KV cache** (`kv_cache/`): 16-token blocks, free list, per-sequence block tables. Prompts allocate exactly `ceil(n/16)` blocks; `engine_kv_waste_fraction` reports allocated-but-empty slots.
 - **Prefix caching**: full blocks are hashed (chained with the previous block's hash, so position-aware) and published only once their K/V are fully computed; later prompts with the same prefix reuse the physical blocks with a refcount, and unowned blocks sit in an LRU until memory pressure evicts them.
-- **Continuous batching** (`scheduler/`): finished sequences leave the batch at the step they finish; new ones join at the next step under a `max_num_batched_tokens` budget. Long prompts are prefilled in chunks, which cuts the worst decode stall 11.8x when a 2,048-token prompt arrives mid-flight. Admission keeps a watermark of free blocks so a new sequence cannot steal the block a resident one needs next, which removed 80-99% of preemption recompute waste at a 0.7% occupancy cost. Out of memory → the youngest sequence is preempted and recomputed on resume. `--mode static` selects the static-batching baseline on the same code path.
+- **Continuous batching** (`scheduler/`): finished sequences leave the batch at the step they finish; new ones join at the next step under a `max_num_batched_tokens` budget. Long prompts are prefilled in chunks, which cuts the worst decode stall 11.8x when a 2,048-token prompt arrives mid-flight. Admission keeps a watermark of free blocks so a new sequence cannot steal the block a resident one needs next, which cut preemption recompute waste from 16.2% to 2.3% of all token work at a 0.7% occupancy cost. Out of memory → the youngest sequence is preempted and recomputed on resume. `--mode static` selects the static-batching baseline on the same code path.
 - **API** (`api/`): `/v1/completions`, `/v1/chat/completions` (ChatML template), SSE streaming with UTF-8-safe chunking, `prompt_token_ids` for benchmarks, `ignore_eos`, per-request `seed`.
 - **Observability**: Prometheus counters, gauges and histograms — queue depth, running sequences, KV blocks free/used/cached, prefix hit ratio, tokens/s, TTFT, inter-token latency, step time, preemptions.
 - **Graceful drain**: SIGTERM flips `/readyz` to 503, finishes in-flight sequences, then exits.

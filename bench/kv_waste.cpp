@@ -274,26 +274,56 @@ void print_row(const Result& r) {
 
 // Recompute-on-resume is the simplest correct preemption policy, but it is not
 // free: a preempted sequence loses every token it had computed. This sweeps the
-// memory budget to show where that cost starts to matter.
-void sweep_pressure(const Workload& w, int block_size, const SchedulerConfig& cfg) {
+// memory budget with the admission watermark off and on, so the comparison that
+// justifies the watermark is reproducible rather than a number remembered from
+// whenever it was first measured.
+struct SweepPoint {
+  int blocks = 0;
+  long long preempt_off = 0, preempt_on = 0;
+  double wasted_off = 0, wasted_on = 0;
+  bool fits = true;
+};
+
+std::vector<SweepPoint> sweep_pressure(const Workload& w, int block_size, SchedulerConfig cfg) {
   std::printf("\nrecompute cost against memory pressure (paged, continuous batching)\n");
-  std::printf("| %8s | %9s | %8s | %11s | %14s |\n",
-              "blocks", "slots", "preempt", "recomputed", "wasted work");
-  std::printf("|%s|%s|%s|%s|%s|\n", std::string(10, '-').c_str(), std::string(11, '-').c_str(),
-              std::string(10, '-').c_str(), std::string(13, '-').c_str(), std::string(16, '-').c_str());
+  std::printf("| %8s | %9s | %18s | %18s |\n", "blocks", "slots",
+              "no watermark", "with watermark");
+  std::printf("| %8s | %9s | %8s %9s | %8s %9s |\n", "", "", "preempt", "wasted", "preempt", "wasted");
+  std::printf("|%s|%s|%s|%s|\n", std::string(10, '-').c_str(), std::string(11, '-').c_str(),
+              std::string(20, '-').c_str(), std::string(20, '-').c_str());
+
+  std::vector<SweepPoint> points;
   for (int blocks : {256, 384, 512, 768, 1024, 2048, 4096}) {
-    Result r = run_paged(w, blocks, block_size, cfg, false);
-    if (r.steps == 0) { std::printf("| %8d | %9d | %8s | %11s | %14s |\n",
-                                    blocks, blocks * block_size, "-", "-", "does not fit"); continue; }
-    const double wasted = static_cast<double>(r.recomputed_tokens) /
-                          static_cast<double>(r.recomputed_tokens + r.useful_tokens);
-    std::printf("| %8d | %9d | %8lld | %11lld | %13.1f%% |\n",
-                blocks, blocks * block_size, r.preemptions, r.recomputed_tokens, 100.0 * wasted);
+    SweepPoint p;
+    p.blocks = blocks;
+    auto measure = [&](int watermark) {
+      SchedulerConfig c = cfg;
+      c.watermark_blocks = watermark;
+      Result r = run_paged(w, blocks, block_size, c, false);
+      const double wasted = r.steps == 0 ? 0.0
+          : static_cast<double>(r.recomputed_tokens) /
+            static_cast<double>(r.recomputed_tokens + r.useful_tokens);
+      return std::make_pair(r.steps == 0, std::make_pair(r.preemptions, wasted));
+    };
+    const auto off = measure(0), on = measure(-1);
+    p.fits = !off.first && !on.first;
+    p.preempt_off = off.second.first;  p.wasted_off = off.second.second;
+    p.preempt_on = on.second.first;    p.wasted_on = on.second.second;
+    points.push_back(p);
+    if (!p.fits) {
+      std::printf("| %8d | %9d | %18s | %18s |\n", blocks, blocks * block_size,
+                  "does not fit", "does not fit");
+      continue;
+    }
+    std::printf("| %8d | %9d | %8lld %8.1f%% | %8lld %8.1f%% |\n",
+                blocks, blocks * block_size, p.preempt_off, 100.0 * p.wasted_off,
+                p.preempt_on, 100.0 * p.wasted_on);
   }
+  return points;
 }
 
 void emit_json(const std::string& path, const std::vector<Result>& rs, const Workload& w,
-               long long slots, int block_size) {
+               long long slots, int block_size, const std::vector<SweepPoint>& sweep) {
   FILE* f = std::fopen(path.c_str(), "w");
   if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return; }
   std::fprintf(f, "{\n  \"workload\": {\"requests\": %zu, \"mean_output_len\": %d, \"max_output_len\": %d,"
@@ -308,7 +338,21 @@ void emit_json(const std::string& path, const std::vector<Result>& rs, const Wor
                  rs[i].mean_resident, rs[i].mean_active, rs[i].peak_resident, rs[i].steps, rs[i].preemptions,
                  rs[i].recomputed_tokens, i + 1 < rs.size() ? "," : "");
   }
-  std::fprintf(f, "  ]\n}\n");
+  std::fprintf(f, "  ]");
+  if (!sweep.empty()) {
+    std::fprintf(f, ",\n  \"pressure_sweep\": [\n");
+    for (size_t i = 0; i < sweep.size(); i++) {
+      const auto& p = sweep[i];
+      std::fprintf(f, "    {\"blocks\": %d, \"kv_slots\": %d, \"fits\": %s,"
+                      " \"preemptions_no_watermark\": %lld, \"wasted_no_watermark\": %.4f,"
+                      " \"preemptions_watermark\": %lld, \"wasted_watermark\": %.4f}%s\n",
+                   p.blocks, p.blocks * block_size, p.fits ? "true" : "false",
+                   p.preempt_off, p.wasted_off, p.preempt_on, p.wasted_on,
+                   i + 1 < sweep.size() ? "," : "");
+    }
+    std::fprintf(f, "  ]");
+  }
+  std::fprintf(f, "\n}\n");
   std::fclose(f);
   std::printf("\nwrote %s\n", path.c_str());
 }
@@ -318,6 +362,7 @@ void emit_json(const std::string& path, const std::vector<Result>& rs, const Wor
 int main(int argc, char** argv) {
   int requests = 512, blocks = 4096, block_size = 16, output_len = 128, max_num_seqs = 64;
   bool fixed_output = false, sweep = false, queueing = false, hol = false;
+  int watermark = -1;   // -1 = the scheduler's automatic policy, 0 = disabled
   std::string json_out = "bench/results/kv-waste.json";
   for (int i = 1; i < argc; i++) {
     auto val = [&] { return std::atoi(argv[++i]); };
@@ -326,6 +371,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--block-size")) block_size = val();
     else if (!std::strcmp(argv[i], "--output-len")) output_len = val();
     else if (!std::strcmp(argv[i], "--max-num-seqs")) max_num_seqs = val();
+    else if (!std::strcmp(argv[i], "--watermark")) watermark = val();
     else if (!std::strcmp(argv[i], "--fixed-output")) fixed_output = true;
     else if (!std::strcmp(argv[i], "--sweep")) sweep = true;
     else if (!std::strcmp(argv[i], "--queueing")) queueing = true;
@@ -340,6 +386,7 @@ int main(int argc, char** argv) {
   const double mean_out = std::accumulate(w.output_len.begin(), w.output_len.end(), 0.0) / requests;
 
   SchedulerConfig cfg;
+  cfg.watermark_blocks = watermark;
   cfg.max_num_seqs = max_num_seqs;
   cfg.max_num_batched_tokens = 4096;
   cfg.prefill_chunk_size = 512;
@@ -387,8 +434,9 @@ int main(int argc, char** argv) {
   std::printf("sequences decoding per step: %.1f paged+continuous vs %.1f paged+static (%.1fx),"
               " %.1f contiguous+continuous\n", best.mean_active, rs[3].mean_active,
               best.mean_active / std::max(rs[3].mean_active, 1e-9), fair.mean_active);
-  if (sweep) sweep_pressure(w, block_size, cfg);
+  std::vector<SweepPoint> sweep_points;
+  if (sweep) sweep_points = sweep_pressure(w, block_size, cfg);
   if (queueing) queueing_experiment(w, hol ? blocks / 4 : blocks / 8, block_size, cfg);
-  emit_json(json_out, rs, w, slots, block_size);
+  emit_json(json_out, rs, w, slots, block_size, sweep_points);
   return 0;
 }

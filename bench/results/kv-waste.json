@@ -1,10 +1,19 @@
 {
-  "workload": {"requests": 256, "mean_output_len": 128, "max_output_len": 659, "prompt_mix": "128/512/1024 at 50/30/20", "kv_slots": 65536, "block_size": 16, "max_model_len": 32768},
+  "workload": {"requests": 512, "mean_output_len": 128, "max_output_len": 777, "prompt_mix": "128/512/1024 at 50/30/20", "kv_slots": 65536, "block_size": 16, "max_model_len": 32768},
   "results": [
-    {"strategy": "contiguous (reserve max_model_len)", "slot_utilization": 0.0159, "kv_waste_fraction": 0.9841, "mean_resident_seqs": 2.00, "mean_active_seqs": 1.36, "peak_resident_seqs": 2, "steps": 24738, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.4797, "kv_waste_fraction": 0.5203, "mean_resident_seqs": 54.62, "mean_active_seqs": 14.23, "peak_resident_seqs": 62, "steps": 2366, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.5406, "kv_waste_fraction": 0.4594, "mean_resident_seqs": 42.82, "mean_active_seqs": 42.82, "peak_resident_seqs": 64, "steps": 786, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "paged, static batching", "slot_utilization": 0.9869, "kv_waste_fraction": 0.0131, "mean_resident_seqs": 63.69, "mean_active_seqs": 16.01, "peak_resident_seqs": 64, "steps": 2086, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "paged, continuous batching", "slot_utilization": 0.9865, "kv_waste_fraction": 0.0135, "mean_resident_seqs": 43.66, "mean_active_seqs": 43.27, "peak_resident_seqs": 64, "steps": 772, "preemptions": 0, "recomputed_tokens": 0}
+    {"strategy": "contiguous (reserve max_model_len)", "slot_utilization": 0.0168, "kv_waste_fraction": 0.9832, "mean_resident_seqs": 2.00, "mean_active_seqs": 1.35, "peak_resident_seqs": 2, "steps": 48885, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.4441, "kv_waste_fraction": 0.5559, "mean_resident_seqs": 51.40, "mean_active_seqs": 12.40, "peak_resident_seqs": 56, "steps": 5339, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.5552, "kv_waste_fraction": 0.4448, "mean_resident_seqs": 37.35, "mean_active_seqs": 37.35, "peak_resident_seqs": 57, "steps": 1772, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "paged, static batching", "slot_utilization": 0.9876, "kv_waste_fraction": 0.0124, "mean_resident_seqs": 63.70, "mean_active_seqs": 14.61, "peak_resident_seqs": 64, "steps": 4496, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "paged, continuous batching", "slot_utilization": 0.9881, "kv_waste_fraction": 0.0119, "mean_resident_seqs": 41.51, "mean_active_seqs": 41.12, "peak_resident_seqs": 64, "steps": 1597, "preemptions": 0, "recomputed_tokens": 0}
+  ],
+  "pressure_sweep": [
+    {"blocks": 256, "kv_slots": 4096, "fits": true, "preemptions_no_watermark": 162, "wasted_no_watermark": 0.1919, "preemptions_watermark": 65, "wasted_watermark": 0.0907},
+    {"blocks": 384, "kv_slots": 6144, "fits": true, "preemptions_no_watermark": 134, "wasted_no_watermark": 0.1536, "preemptions_watermark": 35, "wasted_watermark": 0.0549},
+    {"blocks": 512, "kv_slots": 8192, "fits": true, "preemptions_no_watermark": 135, "wasted_no_watermark": 0.1618, "preemptions_watermark": 15, "wasted_watermark": 0.0233},
+    {"blocks": 768, "kv_slots": 12288, "fits": true, "preemptions_no_watermark": 141, "wasted_no_watermark": 0.1667, "preemptions_watermark": 14, "wasted_watermark": 0.0189},
+    {"blocks": 1024, "kv_slots": 16384, "fits": true, "preemptions_no_watermark": 150, "wasted_no_watermark": 0.1695, "preemptions_watermark": 2, "wasted_watermark": 0.0010},
+    {"blocks": 2048, "kv_slots": 32768, "fits": true, "preemptions_no_watermark": 87, "wasted_no_watermark": 0.1010, "preemptions_watermark": 0, "wasted_watermark": 0.0000},
+    {"blocks": 4096, "kv_slots": 65536, "fits": true, "preemptions_no_watermark": 0, "wasted_no_watermark": 0.0000, "preemptions_watermark": 0, "wasted_watermark": 0.0000}
   ]
 }
