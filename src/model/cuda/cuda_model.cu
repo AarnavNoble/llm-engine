@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,6 +99,112 @@ struct CudaLayer {
   __half* wgate = nullptr;
   __half* wup = nullptr;
   __half* wdown = nullptr;
+};
+
+// Where a decode step actually goes, measured with CUDA events.
+//
+// Nsight Compute is the obvious tool and is unavailable on a rented pod: it
+// needs NVreg_RestrictProfilingToAdminUsers=0, a host kernel-module parameter
+// a container cannot set, and returns ERR_NVGPUCTRPERM without it. CUDA events
+// need no privileges at all. They cannot report achieved bandwidth, which is
+// the thing ncu would have given, but they answer the question that actually
+// decides what to optimise next: which region of a step the time is in.
+//
+// Opt in with ENGINE_PROFILE=1. Off, every method is an inlined branch on a
+// bool. On, it records two events per region per layer, which is cheap but not
+// free, so treat the absolute step time under profiling as slightly inflated
+// and the proportions as the result.
+//
+// Events are recorded on the default stream, which is where every launch here
+// goes, and read only after the step's cudaDeviceSynchronize. Reading one
+// earlier would block on work still queued.
+enum ProfRegion { kEmbed, kNorm, kQKV, kRope, kAttn, kProjO, kMLP, kHead, kRegions };
+const char* const kRegionName[kRegions] = {
+    "embedding", "rmsnorm", "qkv_proj", "rope+store_kv",
+    "attention", "o_proj+residual", "mlp", "head"};
+
+class StepProfile {
+ public:
+  StepProfile() {
+    const char* e = std::getenv("ENGINE_PROFILE");
+    on_ = e && *e && *e != '0';
+  }
+  ~StepProfile() {
+    if (on_) report();
+    for (cudaEvent_t e : pool_) cudaEventDestroy(e);
+  }
+  bool on() const { return on_; }
+
+  void begin(int region) { if (on_) { open_ = region; start_ = mark(); } }
+  void end() { if (on_) spans_.push_back({open_, start_, mark()}); }
+
+  // Must be called after the step has synchronised.
+  void flush() {
+    if (!on_) return;
+    for (const Span& sp : spans_) {
+      // mark() returns an unincremented index if event creation ever failed,
+      // so a span can name an event that does not exist. Dropping it loses one
+      // sample; indexing it would be a buffer overrun in a diagnostic.
+      if (sp.a >= static_cast<int>(pool_.size()) || sp.b >= static_cast<int>(pool_.size()))
+        continue;
+      float ms = 0.f;
+      if (cudaEventElapsedTime(&ms, pool_[sp.a], pool_[sp.b]) == cudaSuccess)
+        total_ms_[sp.region] += ms;
+    }
+    spans_.clear();
+    next_ = 0;
+    steps_++;
+  }
+
+ private:
+  struct Span { int region, a, b; };
+
+  int mark() {
+    if (next_ == pool_.size()) {
+      cudaEvent_t e = nullptr;
+      if (cudaEventCreate(&e) != cudaSuccess) return next_;  // give up quietly
+      pool_.push_back(e);
+    }
+    cudaEventRecord(pool_[next_], nullptr);
+    return next_++;
+  }
+
+  void report() const {
+    if (steps_ == 0) return;
+    double sum = 0;
+    for (int r = 0; r < kRegions; r++) sum += total_ms_[r];
+    if (sum <= 0) return;
+    std::printf("\nper-step cost over %d steps (CUDA events, default stream)\n", steps_);
+    std::printf("%-18s %10s %8s\n", "region", "ms/step", "share");
+    for (int r = 0; r < kRegions; r++)
+      std::printf("%-18s %10.3f %7.1f%%\n", kRegionName[r], total_ms_[r] / steps_,
+                  100.0 * total_ms_[r] / sum);
+    std::printf("%-18s %10.3f\n", "total on device", sum / steps_);
+
+    const char* out = std::getenv("ENGINE_PROFILE_OUT");
+    FILE* f = std::fopen(out && *out ? out : "bench/results/kernel-time.json", "w");
+    if (!f) return;
+    std::fprintf(f, "{\n  \"steps\": %d,\n  \"regions\": [\n", steps_);
+    for (int r = 0; r < kRegions; r++)
+      std::fprintf(f, "    {\"region\": \"%s\", \"ms_per_step\": %.6f, \"share_pct\": %.3f}%s\n",
+                   kRegionName[r], total_ms_[r] / steps_, 100.0 * total_ms_[r] / sum,
+                   r + 1 == kRegions ? "" : ",");
+    std::fprintf(f, "  ],\n  \"device_ms_per_step\": %.6f\n}\n", sum / steps_);
+    std::fclose(f);
+  }
+
+  bool on_ = false;
+  int open_ = 0, start_ = 0, next_ = 0, steps_ = 0;
+  std::vector<cudaEvent_t> pool_;
+  std::vector<Span> spans_;
+  double total_ms_[kRegions] = {0};
+};
+
+// Times one region for as long as it is in scope.
+struct ProfScope {
+  StepProfile& p;
+  ProfScope(StepProfile& p_, int region) : p(p_) { p.begin(region); }
+  ~ProfScope() { p.end(); }
 };
 
 // A device buffer that grows on demand and is then reused. Allocating inside
@@ -237,43 +344,52 @@ class CudaModel final : public Model {
     __half* gate = gate_.get(static_cast<size_t>(N) * I);
     __half* up = up_.get(static_cast<size_t>(N) * I);
 
-    launch_embedding(embed_, d_token_ids_, x, N, H, nullptr);
+    { ProfScope _(prof_, kEmbed);
+      launch_embedding(embed_, d_token_ids_, x, N, H, nullptr); }
 
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
       const CudaLayer& L = layers_[l];
 
-      launch_rmsnorm(x, L.in_norm, h, N, H, cfg_.rms_norm_eps, nullptr);
+      { ProfScope _(prof_, kNorm);
+        launch_rmsnorm(x, L.in_norm, h, N, H, cfg_.rms_norm_eps, nullptr); }
+      { ProfScope _(prof_, kQKV);
       gemm(h, L.wq, q, N, H, H);
       gemm(h, L.wk, k, N, kv_dim_, H);
       gemm(h, L.wv, v, N, kv_dim_, H);
       launch_add_bias(q, L.bq, N, H, nullptr);
       launch_add_bias(k, L.bk, N, kv_dim_, nullptr);
-      launch_add_bias(v, L.bv, N, kv_dim_, nullptr);
+      launch_add_bias(v, L.bv, N, kv_dim_, nullptr); }
 
       // K and V for every token in this step are written before any attention
       // runs, which is what lets tokens that arrived together attend to each
       // other and makes a mixed prefill-and-decode step correct.
+      { ProfScope _(prof_, kRope);
       launch_rope(q, d_positions_, d_cos_, d_sin_, N, nh, hd, H, nullptr);
       launch_rope(k, d_positions_, d_cos_, d_sin_, N, nkv, hd, kv_dim_, nullptr);
-      launch_store_kv(k, v, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr);
+      launch_store_kv(k, v, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr); }
+      { ProfScope _(prof_, kAttn);
       launch_attention_decode(q, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
                               d_token_seq_, d_positions_, attn, N, nh, nkv, hd, bs, scale,
-                              nullptr);
+                              nullptr); }
 
+      { ProfScope _(prof_, kProjO);
       gemm(attn, L.wo, o, N, H, H);
-      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr);
+      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr); }
 
-      launch_rmsnorm(x, L.post_norm, h, N, H, cfg_.rms_norm_eps, nullptr);
+      { ProfScope _(prof_, kNorm);
+        launch_rmsnorm(x, L.post_norm, h, N, H, cfg_.rms_norm_eps, nullptr); }
+      { ProfScope _(prof_, kMLP);
       gemm(h, L.wgate, gate, N, I, H);
       gemm(h, L.wup, up, N, I, H);
       launch_silu_mul(gate, up, static_cast<size_t>(N) * I, nullptr);
       gemm(gate, L.wdown, o, N, H, I);
-      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr);
+      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr); }
     }
 
     if (logit_rows_.empty()) {
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaDeviceSynchronize());
+      prof_.flush();
       return;
     }
 
@@ -284,15 +400,16 @@ class CudaModel final : public Model {
       CUDA_CHECK(cudaMemcpy(o + static_cast<size_t>(r) * H,
                             x + static_cast<size_t>(logit_rows_[r]) * H,
                             static_cast<size_t>(H) * sizeof(__half), cudaMemcpyDeviceToDevice));
-    launch_rmsnorm(o, final_norm_, h, R, H, cfg_.rms_norm_eps, nullptr);
-
     __half* dlog = logits_.get(static_cast<size_t>(R) * cfg_.vocab_size);
-    gemm(h, lm_head_, dlog, R, cfg_.vocab_size, H);
+    { ProfScope _(prof_, kHead);
+      launch_rmsnorm(o, final_norm_, h, R, H, cfg_.rms_norm_eps, nullptr);
+      gemm(h, lm_head_, dlog, R, cfg_.vocab_size, H); }
 
     // One synchronise per step, here, rather than after every launch. Any error
     // from any kernel above surfaces at this point.
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+    prof_.flush();
 
     const size_t count = static_cast<size_t>(R) * cfg_.vocab_size;
     stage_.resize(count);
@@ -418,6 +535,7 @@ class CudaModel final : public Model {
   // excluded deliberately: they are neither weights nor cache, which is what
   // report_memory() claims to be printing.
   size_t weights_bytes_ = 0;
+  StepProfile prof_;
 
   __half* embed_ = nullptr;
   __half* lm_head_ = nullptr;

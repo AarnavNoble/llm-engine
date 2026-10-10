@@ -145,6 +145,14 @@ def prefix_rows():
     ], ratio
 
 
+def step_rows():
+    d = load("kernel-time")
+    if not d:
+        return None, []
+    return d.get("device_ms_per_step"), [(r["region"], r["ms_per_step"], r["share_pct"])
+                                         for r in d.get("regions", [])]
+
+
 def bandwidth_rows():
     d = load("kernel-bandwidth")
     if not d:
@@ -204,6 +212,20 @@ def markdown():
             L.append(f"| {name} | {fmt(a, 1, ' ' + unit)} | {fmt(b, 1, ' ' + unit)} | **{change}** |")
         if ratio:
             L.append(f"\nBlock hit ratio {ratio:.1f}%.")
+
+    step_ms, step = step_rows()
+    if step:
+        L.append("## Where a decode step goes\n")
+        L.append(f"CUDA events on the default stream, 32 concurrent requests, "
+                 f"{step_ms:,.2f} ms of device time per step. Nsight Compute would give achieved "
+                 "bandwidth too and does not run on a rented pod, so this measures which region "
+                 "the time is in rather than how close each is to the memory limit. Recording "
+                 "events costs something, so read the proportions and not the absolute total.\n")
+        L.append("| Region | ms/step | Share |")
+        L.append("|---|---|---|")
+        for name, ms, pct in step:
+            L.append(f"| `{name}` | {ms:,.3f} | {pct:.1f}% |")
+        L.append("")
 
     bw = bandwidth_rows()
     if bw:
