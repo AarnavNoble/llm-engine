@@ -1,8 +1,10 @@
-# engine — an LLM inference server in C++ and CUDA, from scratch
+# engine — an LLM inference server, written from scratch
 
-A small serving engine for Llama-architecture models (Qwen2.5-0.5B, TinyLlama) with the parts production engines are built from: a **paged KV cache** with block tables, **continuous batching** with chunked prefill and preemption, **prefix caching** with refcounted block sharing, an **OpenAI-compatible streaming API**, Prometheus metrics, and a Kubernetes deploy that scales on queue depth. No PyTorch at runtime: weights are read from safetensors, the tokenizer parses `tokenizer.json` directly, and the forward pass is hand-written kernels plus cuBLAS.
+A serving engine for Llama-architecture models (Qwen2.5-0.5B, TinyLlama) with the parts production engines are built from: a **paged KV cache** with block tables, **continuous batching** with chunked prefill and preemption, **prefix caching** with refcounted block sharing, an **OpenAI-compatible streaming API**, Prometheus metrics, and a Kubernetes deploy that scales on queue depth. No PyTorch at runtime: weights are read from safetensors, the tokenizer parses `tokenizer.json` directly, and the forward pass is C++.
 
-Every optimization is a tagged commit with a measured before/after number.
+**Status.** The CPU backend is complete and verified layer by layer against PyTorch on two architectures; it serves real requests over the API. **The CUDA backend is not written yet** — `-DENGINE_CUDA=ON` tells you so rather than pretending. That means the serving mechanisms (paging, batching, prefix sharing, admission control) are built and measured, while GPU throughput and per-kernel bandwidth are not. Rows awaiting it are marked *not measured* on the results page instead of estimated. What remains, and the plan for it, is in [docs/gpu-setup.md](docs/gpu-setup.md).
+
+Every optimization is a commit with a measured before/after number, and CI fails if any figure quoted in the docs disagrees with the data the harness produced.
 
 ## Benchmark
 

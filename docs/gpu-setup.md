@@ -1,3 +1,27 @@
+# GPU box setup, and what is left to build
+
+## What remains
+
+The CPU backend is complete. The CUDA backend is not written: `src/kernels/`
+and `src/model/cuda/` are empty, and configuring with `ENGINE_CUDA=ON` fails
+with a message saying so. The work, in dependency order:
+
+| # | Item | Exit criterion |
+|---|---|---|
+| 1 | `cuda_model.cu`: weight upload, cuBLAS GEMMs, naive rmsnorm / RoPE / silu·up / embedding kernels, naive contiguous attention | GPU logits match the CPU oracle layer by layer |
+| 2 | `sampling.cu` | greedy and top-p on device, logits never reach the host |
+| 3 | **`attention_decode.cu`**: paged, online softmax, GQA-aware | the three invariances still hold; matches the oracle |
+| 4 | `attention_prefill.cu` (or cuBLAS + masked softmax) | same |
+| 5 | Benchmark rows via `scripts/reproduce.sh` | 8 rows stop saying "not measured" |
+| 6 | vLLM row | `bench/vllm_baseline.py`, already written |
+| 7 | Fusions (RoPE + cache write, silu·up), vectorised loads, split-K, `ncu` table | bandwidth against the 1,008 GB/s peak |
+| 8 | CUDA graphs for decode at fixed batch sizes | `nsys` before and after |
+| 9 | k3s + KEDA on this node, Grafana screenshot | scaler reacts to queue depth |
+
+Items 1, 3, 5 are the ones that make the project what it claims to be. Items
+7 and 8 are optimisation; 9 is packaging. The cut order if time runs short is
+9, then 8, then 7, then 4 via cuBLAS.
+
 # GPU box setup (RunPod RTX 4090)
 
 Rules: stop the pod whenever you walk away; keep everything on the persistent volume; push a tag before stopping.

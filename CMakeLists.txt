@@ -51,21 +51,40 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(engine_core PUBLIC -O3)
 endif()
 
+# The CUDA backend. Its sources are listed here before they exist so the build
+# shape is settled, but configuring with ENGINE_CUDA=ON while they are missing
+# would fail with a confusing missing-file error, so say what is actually wrong.
+set(ENGINE_CUDA_SOURCES
+  src/model/cuda/cuda_model.cu
+  src/kernels/rmsnorm.cu
+  src/kernels/rope.cu
+  src/kernels/silu_mul.cu
+  src/kernels/embedding.cu
+  src/kernels/attention_decode.cu
+  src/kernels/attention_prefill.cu
+  src/kernels/sampling.cu
+)
+set(ENGINE_CUDA_MISSING "")
+foreach(src ${ENGINE_CUDA_SOURCES})
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/${src})
+    list(APPEND ENGINE_CUDA_MISSING ${src})
+  endif()
+endforeach()
+
+if(ENGINE_CUDA AND ENGINE_CUDA_MISSING)
+  message(FATAL_ERROR
+    "ENGINE_CUDA=ON but the CUDA backend is not implemented yet.\n"
+    "Missing: ${ENGINE_CUDA_MISSING}\n"
+    "The CPU backend is complete and is the default: drop -DENGINE_CUDA=ON.\n"
+    "Status and the plan for the GPU work are in docs/gpu-setup.md.")
+endif()
+
 if(ENGINE_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "sm_89 = RTX 4090")
   find_package(CUDAToolkit REQUIRED)
-  add_library(engine_cuda
-    src/model/cuda/cuda_model.cu
-    src/kernels/rmsnorm.cu
-    src/kernels/rope.cu
-    src/kernels/silu_mul.cu
-    src/kernels/embedding.cu
-    src/kernels/attention_decode.cu
-    src/kernels/attention_prefill.cu
-    src/kernels/sampling.cu
-  )
+  add_library(engine_cuda ${ENGINE_CUDA_SOURCES})
   target_include_directories(engine_cuda PUBLIC include)
   target_link_libraries(engine_cuda PUBLIC engine_core CUDA::cudart CUDA::cublas)
   target_compile_definitions(engine_core PUBLIC ENGINE_CUDA=1)
