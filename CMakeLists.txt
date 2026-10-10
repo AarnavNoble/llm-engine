@@ -92,6 +92,11 @@ if(ENGINE_CUDA)
   target_include_directories(engine_cuda PUBLIC include)
   target_link_libraries(engine_cuda PUBLIC CUDA::cudart CUDA::cublas
                         nlohmann_json::nlohmann_json)
+  # Both targets need the define: engine_core because it chooses a backend, and
+  # engine_cuda because the kernel declarations in cuda_kernels.h are guarded by
+  # it. Setting it only on engine_core hid those declarations from the one file
+  # that calls them.
+  target_compile_definitions(engine_cuda PUBLIC ENGINE_CUDA=1)
   target_compile_definitions(engine_core PUBLIC ENGINE_CUDA=1)
   target_link_libraries(engine_core PUBLIC engine_cuda)
 endif()
