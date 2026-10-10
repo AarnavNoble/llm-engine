@@ -80,8 +80,13 @@ def main(a):
             "--max-num-batched-tokens", str(a.max_batched_tokens),
             "--num-gpu-blocks-override", str(a.num_blocks),
             "--block-size", "16",
-            "--disable-log-requests",
         ]
+        # --disable-log-requests was removed in vLLM 0.31 ("unrecognized
+        # arguments"), and per-request logging is off by default there, so the
+        # flag is simply dropped rather than replaced. This failed the whole
+        # reference row on a working install; the row is the one number here
+        # measured by someone else's code, so it is worth keeping startable
+        # across versions.
         if not a.prefix_caching:
             cmd.append("--no-enable-prefix-caching")
         print("$", " ".join(cmd))
