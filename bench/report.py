@@ -145,6 +145,14 @@ def prefix_rows():
     ], ratio
 
 
+def bandwidth_rows():
+    d = load("kernel-bandwidth")
+    if not d:
+        return []
+    return [(r["kernel"], r["calls"], r["total_ms"], r["mean_us"], r.get("pct_of_peak_dram"))
+            for r in d]
+
+
 def chunk_rows():
     runs = load("chunked-prefill")
     if not runs:
@@ -196,6 +204,21 @@ def markdown():
             L.append(f"| {name} | {fmt(a, 1, ' ' + unit)} | {fmt(b, 1, ' ' + unit)} | **{change}** |")
         if ratio:
             L.append(f"\nBlock hit ratio {ratio:.1f}%.")
+
+    bw = bandwidth_rows()
+    if bw:
+        L.append("## Per-kernel achieved memory bandwidth\n")
+        L.append("Nsight Compute, one generate run. Decode is memory bound, so the question "
+                 "is how close each kernel runs to the memory system's limit rather than how "
+                 "many GB/s it moves; a kernel well under peak has an access-pattern problem "
+                 "worth fixing, and one near it is finished. Profiling serialises and replays "
+                 "kernels, so the absolute times are not wall-clock figures.\n")
+        L.append("| Kernel | Calls | Total ms | Mean us | % of peak DRAM |")
+        L.append("|---|---|---|---|---|")
+        for k, c, tot, mean, pct in bw:
+            L.append(f"| `{k}` | {c:,} | {tot:,.2f} | {mean:,.1f} | "
+                     f"{'not measured' if pct is None else f'{pct:.1f}%'} |")
+        L.append("")
 
     ch = chunk_rows()
     if ch:
