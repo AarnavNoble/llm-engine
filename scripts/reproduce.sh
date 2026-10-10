@@ -42,6 +42,17 @@ RUNS=$([ $QUICK = 1 ] && echo 1 || echo 3)
 BLOCKS=4096
 
 say() { printf "\n\033[1m== %s\033[0m\n" "$*"; }
+# nvcc is commonly installed outside the default PATH, and a login shell picks
+# it up from a profile script that a non-interactive ssh or CI shell never
+# sources. Without this, the same checkout configures fine when a human types
+# the command and fails with "No CMAKE_CUDA_COMPILER could be found" when
+# anything automated runs it.
+if ! command -v nvcc >/dev/null 2>&1; then
+  for d in /usr/local/cuda/bin /usr/local/cuda-*/bin; do
+    [ -x "$d/nvcc" ] && { export PATH="$d:$PATH"; break; }
+  done
+fi
+
 have_gpu() { [ $FORCE_CPU = 0 ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; }
 
 # ----------------------------------------------------------------- preparation
