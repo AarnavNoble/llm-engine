@@ -139,13 +139,25 @@ say "chunked prefill"
 python3 scripts/bench_chunked_prefill.py --backend "$BACKEND" --chunks 2048 512 128
 
 # --------------------------------------------------------------- reference row
-if command -v vllm >/dev/null 2>&1 && have_gpu; then
+# vLLM pins its own torch, so installing it beside the reference dumps' torch
+# is a good way to break both. It belongs in its own virtualenv, which means
+# looking for its interpreter rather than for vllm on PATH.
+VLLM_PY=""
+if command -v vllm >/dev/null 2>&1; then
+  VLLM_PY=python3
+else
+  for v in "${VLLM_VENV:-}" /workspace/vllm-env ~/vllm-env .venv-vllm; do
+    [ -n "$v" ] && [ -x "$v/bin/vllm" ] && { VLLM_PY="$v/bin/python"; break; }
+  done
+fi
+
+if [ -n "$VLLM_PY" ] && have_gpu; then
   say "vLLM reference row"
-  python3 bench/vllm_baseline.py --tag vllm --concurrency "$CONC" \
+  "$VLLM_PY" bench/vllm_baseline.py --tag vllm --concurrency "$CONC" \
     --num-requests "$REQUESTS" --num-blocks "$BLOCKS" --runs "$RUNS"
 else
   say "skipping vLLM row"
-  echo "needs a GPU and 'pip install vllm'"
+  echo "needs a GPU and vllm in PATH or a virtualenv (set VLLM_VENV=/path)"
 fi
 
 if ! have_gpu; then
