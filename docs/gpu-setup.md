@@ -2,6 +2,11 @@
 
 ## What remains
 
+Step-by-step commands with exit criteria are in [runbook.md](runbook.md); the
+design of each kernel, including the reference it must match and the mistakes
+that actually happen, is in [kernel-plan.md](kernel-plan.md). This page is the
+machine setup.
+
 The CPU backend is complete. The CUDA backend is not written: `src/kernels/`
 and `src/model/cuda/` are empty, and configuring with `ENGINE_CUDA=ON` fails
 with a message saying so. The work, in dependency order:
