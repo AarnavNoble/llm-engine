@@ -306,7 +306,13 @@ def main():
     out_dir = pathlib.Path(os.environ.get("ENGINE_REPORT_DIR", ROOT / "docs"))
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.md").write_text(md)
-    (out_dir / "results.html").write_text(html(md))
+    page = html(md)
+    (out_dir / "results.html").write_text(page)
+    # GitHub Pages serves this directory and wants an index. Writing it here
+    # rather than committing a hand-made landing page keeps the published site
+    # and the measured numbers the same artifact: there is no second copy to
+    # fall out of date, because both come from this function.
+    (out_dir / "index.html").write_text(page)
     rows = serving_rows()
     measured = sum(1 for r in rows if r[2] is not None)
     print(f"wrote {out_dir}/results.md and {out_dir}/results.html "
