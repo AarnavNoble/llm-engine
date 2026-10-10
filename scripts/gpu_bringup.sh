@@ -40,7 +40,16 @@ else
 fi
 
 step "python packages"
-pip install -q -r reference/requirements.txt
+# Ubuntu 24.04 marks the system Python externally managed (PEP 668) and
+# refuses a plain pip install, which aborts bring-up before anything is built.
+# A rented pod is a disposable container with one job, so installing into the
+# system interpreter is the right answer here rather than a virtualenv; the
+# flag is probed for instead of assumed because older images reject it.
+PIP_FLAGS=""
+if pip install --help 2>/dev/null | grep -q -- --break-system-packages; then
+  PIP_FLAGS="--break-system-packages"
+fi
+pip install -q $PIP_FLAGS -r reference/requirements.txt
 python3 - <<'PY'
 import torch, transformers
 print("torch", torch.__version__, "| cuda available:", torch.cuda.is_available())
