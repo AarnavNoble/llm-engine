@@ -294,7 +294,7 @@ allocator alone.
 | + continuous batching | GPU |
 | + prefix caching | GPU |
 | + fused kernels, optimized decode attention | kernels not written |
-| + CUDA graphs | kernels not written |
+| + CUDA graphs | GPU, and graph capture not implemented |
 | KV waste column | **done, above** |
 
 ## Reproducing

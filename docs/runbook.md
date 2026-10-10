@@ -1,7 +1,9 @@
 # Runbook: finishing the CUDA backend
 
-Follow top to bottom. Every step has a command, an exit criterion, and what to do
-when it fails. Design decisions for each kernel are in
+Follow top to bottom. Sessions 1 to 3 are done -- the CUDA backend builds and
+matches the CPU oracle -- and are kept as a record of the order the work went
+in, not as instructions to repeat. Every step has a command, an exit criterion,
+and what to do when it fails. Design decisions for each kernel are in
 [kernel-plan.md](kernel-plan.md); read that before session 2 rather than during
 it.
 
@@ -48,8 +50,10 @@ full suite, generates the PyTorch per-layer dumps and the per-operation golden
 tensors, and prints the compute capability to build for. It is idempotent, so
 re-run it after any pod restart.
 
-**Exit:** `gpu_bringup.sh` finishes with "ready", and it tells you the CUDA
-backend is not implemented, which is the work below.
+**Exit:** `gpu_bringup.sh` finishes with "ready", having configured a CUDA
+build and generated text with it. It used to report the backend as unimplemented
+instead; that branch is gated on `attention_decode.cu` being absent, which it no
+longer is.
 
 ### Then, in this order
 

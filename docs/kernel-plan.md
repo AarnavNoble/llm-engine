@@ -4,6 +4,12 @@ One section per kernel: what it computes, how to decompose it, the reference it
 must agree with, and the mistakes that actually happen. Written before renting a
 GPU so that design is not done on a clock.
 
+Two kernels are not planned here because they were not foreseen here. The K/V
+cache write became a kernel of its own rather than part of RoPE (see section 2),
+and the residual and bias adds became `elementwise.cu` once the forward pass
+stopped round-tripping through the host. Both are documented in their own
+files.
+
 Every kernel has a reference in `include/engine/ops.h` and a golden tensor dumped
 by `./build/golden_dump`. The loop is always:
 
@@ -94,7 +100,7 @@ hidden 896 in fp16 is ~15 MB of traffic, under 20 µs.
 
 ---
 
-## 2. `rope.cu`, fused with the K/V cache write
+## 2. `rope.cu`, and the K/V cache write beside it
 
 **Computes** rotary embedding in HF's `rotate_half` convention: for each head,
 element `i` pairs with `i + head_dim/2`:
@@ -104,17 +110,24 @@ out[i]      = x[i] * cos[pos][i] - x[i+half] * sin[pos][i]
 out[i+half] = x[i+half] * cos[pos][i] + x[i] * sin[pos][i]
 ```
 
-Applied to Q in place and to K **on its way into the cache**, so K is written
-exactly once. V is copied to the cache unrotated.
+Applied to Q in place and to K before K goes into the cache. V is copied to the
+cache unrotated -- a kernel that rotates V still passes a Q-only check, so the
+golden test asserts V is untouched.
 
 **Decomposition.** Grid `(N, q_heads)` for Q and `(N, kv_heads)` for K, or one
 kernel with `heads = q_heads + kv_heads` and a branch. `head_dim/2 = 32` threads
 per head, each owning one pair.
 
-**Fusing the cache write is the point.** Unfused, K is written to a temporary and
-then copied: two extra passes over `N*kv_heads*head_dim`. Fused, the kernel reads
-the projection output and writes straight to `slot_ids[i]`. Measure both and keep
-the number; this is one of the table's optimisation rows.
+**Fusing the cache write is the point, and it has not been done yet.** This
+section planned one fused kernel; what shipped is two, `rope.cu` and
+`store_kv.cu`, deliberately kept apart. Unfused, K is written to a temporary and
+then copied: two extra passes over `N*kv_heads*head_dim`. Fused, the kernel
+reads the projection output and writes straight to `slot_ids[i]`.
+
+Keeping them separate first means the fusion can be published as a measured
+before/after rather than asserted, which is what the optimisation rows in the
+results table are for. The cost of that choice is the two extra passes, paid on
+every step until the row is filled in.
 
 **Reference** `ref::rope_inplace`. **Golden** `rope.L0.bin` (q and k) from
 `qkv_proj.L0.bin`.
