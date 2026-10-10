@@ -65,7 +65,13 @@ def make_prompt_ids(n, tok_ids):
     return [tok_ids[i % len(tok_ids)] for i in range(n)]
 
 async def one(session, url, ids, out_len, ignore_eos, rec, model=None):
-    body = {"prompt_token_ids": ids, "max_tokens": out_len, "temperature": 0, "stream": True, "ignore_eos": ignore_eos}
+    # Token ids go in "prompt" as an array, which is the OpenAI spelling and
+    # what both servers accept. The older "prompt_token_ids" is a vLLM
+    # extension that vLLM 0.31 itself dropped, answering with
+    # "Either prompt or prompt_embeds must be provided"; this engine's server
+    # takes either. One field for both keeps the generator honest -- the
+    # reference row has to be driven by exactly the same client as our own.
+    body = {"prompt": ids, "max_tokens": out_len, "temperature": 0, "stream": True, "ignore_eos": ignore_eos}
     # This engine ignores "model" -- it serves exactly one. vLLM's
     # OpenAI-compatible API requires it and answers a request without one with
     # a 400 in plain JSON, so no SSE frames ever arrive. Sent only when asked
