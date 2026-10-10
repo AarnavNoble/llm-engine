@@ -89,6 +89,35 @@ if [ "$BACKEND" = cuda ]; then
   ./build/engine generate --model "$MODEL" --backend cuda --prompt hi --max-tokens 1 >/dev/null
 fi
 
+# Record the hardware alongside the numbers. A throughput table without the
+# card it ran on is not a result, and writing it by hand in the docs is how it
+# comes to disagree with the data.
+say "environment"
+python3 - "$RESULTS_DIR/env.json" <<'PYENV'
+import json, platform, subprocess, sys
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=20).stdout.strip().splitlines()[0].strip()
+    except Exception:
+        return None
+
+gpu = sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+env = {
+    "gpu": gpu.replace(", ", " ") if gpu else None,
+    "driver": (lambda d: f"driver {d}" if d else None)(
+        sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader")),
+    "cuda": (lambda v: f"CUDA {v.split()[-1]}" if v else None)(
+        sh("nvcc --version | tail -1")),
+    "cpu": sh("lscpu | sed -n 's/^Model name: *//p'") or platform.processor() or None,
+    "os": platform.platform(),
+    "commit": sh("git rev-parse --short HEAD"),
+}
+json.dump(env, open(sys.argv[1], "w"), indent=2)
+print({k: v for k, v in env.items() if v})
+PYENV
+
 say "correctness"
 # The numerical comparison needs the PyTorch dumps; generate them if absent.
 if [ ! -d tests/data/Qwen2.5-0.5B-Instruct/ref ]; then
