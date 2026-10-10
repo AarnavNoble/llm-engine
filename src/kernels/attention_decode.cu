@@ -31,6 +31,8 @@
 
 #include <cfloat>
 #include <cstddef>
+#include <stdexcept>
+#include <string>
 
 namespace engine {
 namespace {
@@ -134,6 +136,22 @@ void launch_attention_decode(const __half* q, const __half* k_cache, const __hal
                              int n_tokens, int q_heads, int kv_heads, int head_dim,
                              int block_size, float scale, cudaStream_t stream) {
   if (n_tokens <= 0 || q_heads <= 0) return;
+  // kMaxHeadDim was declared as a bound and never enforced, so it documented an
+  // intention rather than imposing one. The shared-memory request below grows
+  // with head_dim: 17 KiB at 64 and 33 KiB at 128, both inside the 48 KiB
+  // static limit, but 48.1 KiB at 192 -- a Gemma-class geometry -- where the
+  // launch fails with cudaErrorInvalidValue. Nothing checked the launch, so
+  // execution carried on through every layer reading uninitialised attention
+  // output, and the error finally surfaced at the next synchronisation point,
+  // blaming the logits gather for a kernel that never ran.
+  if (head_dim > kMaxHeadDim) {
+    throw std::runtime_error(
+        "attention_decode: head_dim " + std::to_string(head_dim) + " exceeds " +
+        std::to_string(kMaxHeadDim) + ", the largest this kernel's shared-memory "
+        "layout supports (" + std::to_string(kThreads) +
+        " threads each holding a head_dim accumulator). Raising it needs the "
+        "accumulators moved out of shared memory, not a bigger constant.");
+  }
   const size_t smem = (static_cast<size_t>(head_dim) +
                        static_cast<size_t>(kThreads) * head_dim + 2 * kThreads) * sizeof(float);
   const dim3 grid(n_tokens, q_heads);

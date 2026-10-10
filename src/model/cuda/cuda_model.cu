@@ -46,10 +46,12 @@ namespace {
                                " cuBLAS status " + std::to_string(int(s_)));         \
   } while (0)
 
-size_t g_allocated = 0;
-
+// Allocation is accounted into a caller-supplied counter rather than a global.
+// A file-scope total only ever incremented, so with more than one model alive
+// in a process -- the test suite builds five -- each reported a figure that
+// included every model before it. The leak below looked like a large model.
 template <typename T>
-T* device_alloc(size_t count) {
+T* device_alloc(size_t count, size_t* acct = nullptr) {
   T* p = nullptr;
   const size_t bytes = count * sizeof(T);
   const cudaError_t e = cudaMalloc(&p, bytes);
@@ -63,22 +65,22 @@ T* device_alloc(size_t count) {
                              std::to_string(free_b >> 20) + " MiB free of " +
                              std::to_string(total_b >> 20) + " MiB.");
   }
-  g_allocated += bytes;
+  if (acct) *acct += bytes;
   return p;
 }
 
 // Weights ship as bf16 and the device wants fp16. Norms and biases stay fp32:
 // they are tiny, and the reference uses them in fp32.
-__half* upload_f16(const TensorView& t) {
+__half* upload_f16(const TensorView& t, size_t* acct = nullptr) {
   const std::vector<uint16_t> h = t.to_f16();
-  __half* d = device_alloc<__half>(h.size());
+  __half* d = device_alloc<__half>(h.size(), acct);
   CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
   return d;
 }
 
-float* upload_f32(const TensorView& t) {
+float* upload_f32(const TensorView& t, size_t* acct = nullptr) {
   const Tensor h = t.to_f32();
-  float* d = device_alloc<float>(h.numel());
+  float* d = device_alloc<float>(h.numel(), acct);
   CUDA_CHECK(cudaMemcpy(d, h.ptr(), h.numel() * sizeof(float), cudaMemcpyHostToDevice));
   return d;
 }
@@ -106,6 +108,14 @@ struct Scratch {
   T* ptr = nullptr;
   size_t cap = 0;
 
+  Scratch() = default;
+  // Owns a device pointer, so copying one would free it twice.
+  Scratch(const Scratch&) = delete;
+  Scratch& operator=(const Scratch&) = delete;
+  ~Scratch() {
+    if (ptr) cudaFree(ptr);   // a destructor cannot throw; nothing to recover
+  }
+
   T* get(size_t need) {
     if (cap < need) {
       if (ptr) CUDA_CHECK(cudaFree(ptr));
@@ -121,6 +131,28 @@ class CudaModel final : public Model {
   CudaModel(const std::string& dir, const KVCacheManager& kv)
       : cfg_(ModelConfig::load(dir)), kv_(kv) {
     CUDA_CHECK(cudaSetDevice(0));
+
+    // Four places in this file hardcode the Q projection's output width as
+    // hidden_size: the Q GEMM, q_'s size, the row stride handed to RoPE, and
+    // the row stride attention writes with. That holds only while
+    // num_attention_heads * head_dim == hidden_size, which config.json is free
+    // to violate -- Qwen3-0.6B has hidden_size 1024 with 16 heads of 128, so
+    // 2048. There the Q GEMM would write half the width it should, RoPE would
+    // stride wrong, and attention would write N*2048 halves into an N*1024
+    // buffer, running off the end into whatever Scratch allocated next. That
+    // is silent corruption of k or attn, not a crash, so it is checked here
+    // rather than discovered as bad output.
+    if (cfg_.num_attention_heads * cfg_.head_dim != cfg_.hidden_size) {
+      throw std::runtime_error(
+          "cuda backend: num_attention_heads * head_dim (" +
+          std::to_string(cfg_.num_attention_heads) + " * " +
+          std::to_string(cfg_.head_dim) + " = " +
+          std::to_string(cfg_.num_attention_heads * cfg_.head_dim) +
+          ") must equal hidden_size (" + std::to_string(cfg_.hidden_size) +
+          ") for this model. The CPU backend handles the general case; see "
+          "docs/gpu-setup.md.");
+    }
+
     CUBLAS_CHECK(cublasCreate(&blas_));
     load_weights(dir);
 
@@ -128,8 +160,8 @@ class CudaModel final : public Model {
     // kernel would be slower and would drift from the reference.
     ref::RopeTables rope;
     rope.build(cfg_.head_dim, cfg_.max_position_embeddings, cfg_.rope_theta);
-    d_cos_ = device_alloc<float>(rope.cos.size());
-    d_sin_ = device_alloc<float>(rope.sin.size());
+    d_cos_ = device_alloc<float>(rope.cos.size(), &weights_bytes_);
+    d_sin_ = device_alloc<float>(rope.sin.size(), &weights_bytes_);
     CUDA_CHECK(cudaMemcpy(d_cos_, rope.cos.data(), rope.cos.size() * sizeof(float),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_sin_, rope.sin.data(), rope.sin.size() * sizeof(float),
@@ -140,15 +172,43 @@ class CudaModel final : public Model {
     k_cache_.resize(cfg_.num_hidden_layers);
     v_cache_.resize(cfg_.num_hidden_layers);
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
-      k_cache_[l] = device_alloc<__half>(slots * kv_dim_);
-      v_cache_[l] = device_alloc<__half>(slots * kv_dim_);
+      k_cache_[l] = device_alloc<__half>(slots * kv_dim_, &weights_bytes_);
+      v_cache_[l] = device_alloc<__half>(slots * kv_dim_, &weights_bytes_);
       CUDA_CHECK(cudaMemset(k_cache_[l], 0, slots * kv_dim_ * sizeof(__half)));
       CUDA_CHECK(cudaMemset(v_cache_[l], 0, slots * kv_dim_ * sizeof(__half)));
     }
     report_memory();
   }
 
+  // Releases every device allocation, not just the cuBLAS handle.
+  //
+  // This used to free blas_ alone. One model is about a gigabyte of fp16
+  // weights -- the 151936x896 embedding is 272 MiB by itself -- plus the KV
+  // cache, and the test suite constructs five in a single process. The dead
+  // memory accumulated until a cudaMalloc failed and reported the pool as too
+  // large for the card, which is actively misleading: the pool was fine, the
+  // previous models were still resident. On a server that reloads a model it
+  // is an unbounded leak.
   ~CudaModel() override {
+    for (__half* p : k_cache_) if (p) cudaFree(p);
+    for (__half* p : v_cache_) if (p) cudaFree(p);
+    for (CudaLayer& L : layers_) {
+      for (void* p : {static_cast<void*>(L.in_norm), static_cast<void*>(L.post_norm),
+                      static_cast<void*>(L.wq), static_cast<void*>(L.wk),
+                      static_cast<void*>(L.wv), static_cast<void*>(L.wo),
+                      static_cast<void*>(L.bq), static_cast<void*>(L.bk),
+                      static_cast<void*>(L.bv), static_cast<void*>(L.wgate),
+                      static_cast<void*>(L.wup), static_cast<void*>(L.wdown)})
+        if (p) cudaFree(p);
+    }
+    if (d_cos_) cudaFree(d_cos_);
+    if (d_sin_) cudaFree(d_sin_);
+    if (final_norm_) cudaFree(final_norm_);
+    // A tied head is the embedding read a second time, not a copy, so freeing
+    // both would be a double free.
+    if (lm_head_ && lm_head_ != embed_) cudaFree(lm_head_);
+    if (embed_) cudaFree(embed_);
+    // The Scratch members free themselves.
     if (blas_) cublasDestroy(blas_);
   }
 
@@ -304,29 +364,29 @@ class CudaModel final : public Model {
 
   void load_weights(const std::string& dir) {
     SafeTensorsDir w(dir);
-    embed_ = upload_f16(w.get("model.embed_tokens.weight"));
-    final_norm_ = upload_f32(w.get("model.norm.weight"));
+    embed_ = upload_f16(w.get("model.embed_tokens.weight"), &weights_bytes_);
+    final_norm_ = upload_f32(w.get("model.norm.weight"), &weights_bytes_);
     // A tied head is the embedding table read a second time, not a copy of it.
-    lm_head_ = cfg_.tie_word_embeddings ? embed_ : upload_f16(w.get("lm_head.weight"));
+    lm_head_ = cfg_.tie_word_embeddings ? embed_ : upload_f16(w.get("lm_head.weight"), &weights_bytes_);
 
     layers_.resize(cfg_.num_hidden_layers);
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
       const std::string p = "model.layers." + std::to_string(l) + ".";
       CudaLayer& L = layers_[l];
-      L.in_norm = upload_f32(w.get(p + "input_layernorm.weight"));
-      L.post_norm = upload_f32(w.get(p + "post_attention_layernorm.weight"));
-      L.wq = upload_f16(w.get(p + "self_attn.q_proj.weight"));
-      L.wk = upload_f16(w.get(p + "self_attn.k_proj.weight"));
-      L.wv = upload_f16(w.get(p + "self_attn.v_proj.weight"));
-      L.wo = upload_f16(w.get(p + "self_attn.o_proj.weight"));
+      L.in_norm = upload_f32(w.get(p + "input_layernorm.weight"), &weights_bytes_);
+      L.post_norm = upload_f32(w.get(p + "post_attention_layernorm.weight"), &weights_bytes_);
+      L.wq = upload_f16(w.get(p + "self_attn.q_proj.weight"), &weights_bytes_);
+      L.wk = upload_f16(w.get(p + "self_attn.k_proj.weight"), &weights_bytes_);
+      L.wv = upload_f16(w.get(p + "self_attn.v_proj.weight"), &weights_bytes_);
+      L.wo = upload_f16(w.get(p + "self_attn.o_proj.weight"), &weights_bytes_);
       if (w.has(p + "self_attn.q_proj.bias")) {
-        L.bq = upload_f32(w.get(p + "self_attn.q_proj.bias"));
-        L.bk = upload_f32(w.get(p + "self_attn.k_proj.bias"));
-        L.bv = upload_f32(w.get(p + "self_attn.v_proj.bias"));
+        L.bq = upload_f32(w.get(p + "self_attn.q_proj.bias"), &weights_bytes_);
+        L.bk = upload_f32(w.get(p + "self_attn.k_proj.bias"), &weights_bytes_);
+        L.bv = upload_f32(w.get(p + "self_attn.v_proj.bias"), &weights_bytes_);
       }
-      L.wgate = upload_f16(w.get(p + "mlp.gate_proj.weight"));
-      L.wup = upload_f16(w.get(p + "mlp.up_proj.weight"));
-      L.wdown = upload_f16(w.get(p + "mlp.down_proj.weight"));
+      L.wgate = upload_f16(w.get(p + "mlp.gate_proj.weight"), &weights_bytes_);
+      L.wup = upload_f16(w.get(p + "mlp.up_proj.weight"), &weights_bytes_);
+      L.wdown = upload_f16(w.get(p + "mlp.down_proj.weight"), &weights_bytes_);
     }
   }
 
@@ -334,7 +394,7 @@ class CudaModel final : public Model {
     size_t free_b = 0, total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     std::printf("cuda: %s, weights and cache %zu MiB, device %zu MiB free of %zu MiB\n",
-                cfg_.model_type.c_str(), g_allocated >> 20, free_b >> 20, total_b >> 20);
+                cfg_.model_type.c_str(), weights_bytes_ >> 20, free_b >> 20, total_b >> 20);
     std::fflush(stdout);
   }
 
@@ -354,6 +414,10 @@ class CudaModel final : public Model {
   ModelConfig cfg_;
   const KVCacheManager& kv_;
   cublasHandle_t blas_ = nullptr;
+  // This model's weights, rotation tables and KV cache. Scratch buffers are
+  // excluded deliberately: they are neither weights nor cache, which is what
+  // report_memory() claims to be printing.
+  size_t weights_bytes_ = 0;
 
   __half* embed_ = nullptr;
   __half* lm_head_ = nullptr;
