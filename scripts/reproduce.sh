@@ -146,6 +146,23 @@ bench_mode() {  # bench_mode <mode> <tag>
   local mode=$1 tag=$2 port=$((8400 + RANDOM % 200))
   rm -f "$RESULTS_DIR/$tag.json"
   local pid; pid=$(run_server "$mode" "$port")
+
+  # One unrecorded warmup pass. On a GPU the first run of a fresh server is
+  # measurably slower than the ones after it -- first-touch page faults on the
+  # scratch buffers, cuBLAS handle setup and heuristic selection, and clocks
+  # ramping from idle. Measured on an A40 the first run came in at 317 tok/s
+  # against 381 and 385 for the two after it, on an otherwise idle box.
+  #
+  # Taking the median of three absorbs that, which is exactly the problem: the
+  # statistic was quietly covering for the apparatus, and it would stop doing so
+  # the moment RUNS dropped to 1 or 2. Discarding a warmup pass explicitly is
+  # cheaper than relying on an outlier-robust average to hide a known effect.
+  # Written to a scratch tag so it cannot reach the published file.
+  ENGINE_RESULTS_DIR="$(mktemp -d)" python3 bench/loadgen.py \
+    --url "http://localhost:$port" --tag "$tag-warmup" \
+    --concurrency "$CONC" --num-requests "$REQUESTS" --output-len 128 \
+    --output-dist geometric >/dev/null
+
   for _ in $(seq 1 "$RUNS"); do
     python3 bench/loadgen.py --url "http://localhost:$port" --tag "$tag" \
       --concurrency "$CONC" --num-requests "$REQUESTS" --output-len 128 --output-dist geometric
@@ -182,8 +199,15 @@ fi
 
 if [ -n "$VLLM_PY" ] && have_gpu; then
   say "vLLM reference row"
-  "$VLLM_PY" bench/vllm_baseline.py --tag vllm --concurrency "$CONC" \
-    --num-requests "$REQUESTS" --num-blocks "$BLOCKS" --runs "$RUNS"
+  # Not allowed to abort the run. This is one optional reference row, and under
+  # 'set -e' a failure here killed the whole script before the report was
+  # written -- forty minutes of correct engine measurements discarded because a
+  # third-party baseline did not start. The failure is reported and the run
+  # continues with the row left unmeasured, which is what an absent row means.
+  if ! "$VLLM_PY" bench/vllm_baseline.py --tag vllm --concurrency "$CONC" \
+       --num-requests "$REQUESTS" --num-blocks "$BLOCKS" --runs "$RUNS"; then
+    echo "vLLM row FAILED; see /tmp/vllm-baseline.log. Continuing without it." >&2
+  fi
 else
   say "skipping vLLM row"
   echo "needs a GPU and vllm in PATH or a virtualenv (set VLLM_VENV=/path)"

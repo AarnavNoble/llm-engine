@@ -28,6 +28,22 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+def vllm_exe():
+    """Path to the vllm CLI.
+
+    Not simply shutil.which("vllm"): vLLM pins its own torch, so it belongs in
+    a virtualenv of its own rather than beside the torch that generates the
+    reference logit dumps. Driving it as <venv>/bin/python this_script.py is
+    the way to use that venv without activating it, and in that case the vllm
+    binary sits next to sys.executable and is not on PATH at all. Checking only
+    PATH reported vLLM as missing on a box where it was installed and working.
+    """
+    local = pathlib.Path(sys.executable).parent / "vllm"
+    if local.exists():
+        return str(local)
+    return shutil.which("vllm")
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -46,7 +62,8 @@ def wait_ready(base, timeout):
 
 
 def main(a):
-    if shutil.which("vllm") is None and not a.url:
+    exe = vllm_exe()
+    if exe is None and not a.url:
         sys.exit("vllm not installed (pip install vllm), or pass --url for a server you already run")
 
     port = a.port or free_port()
@@ -56,7 +73,7 @@ def main(a):
         # num-gpu-blocks-override pins the KV capacity to the engine's, so the
         # comparison is at equal memory rather than equal hardware.
         cmd = [
-            "vllm", "serve", a.model,
+            exe, "serve", a.model,
             "--port", str(port),
             "--dtype", "float16",
             "--max-num-seqs", str(a.max_num_seqs),

@@ -33,6 +33,20 @@ run() {  # run <tag> <extra server flags...>
 RESULTS_DIR=${ENGINE_RESULTS_DIR:-bench/results}
 mkdir -p "$RESULTS_DIR"
 rm -f "$RESULTS_DIR/prefix-on.json" "$RESULTS_DIR/prefix-off.json"
+
+# The off case always runs first, so without this it pays the cold-device cost
+# -- clocks ramping from idle, driver context creation -- and the on case runs
+# on a warm GPU. That difference lands straight in the TTFT ratio this script
+# exists to report, in the direction that flatters prefix caching. Each case
+# already gets its own fresh server, so the per-process costs were symmetric;
+# this is the device-level asymmetry the ordering introduces.
+#
+# It matters more here than in the serving table: that table takes a median of
+# three runs, while these two numbers are single runs with nothing to absorb an
+# outlier.
+echo "=== warmup (discarded) ==="
+ENGINE_RESULTS_DIR="$(mktemp -d)" run prefix-warmup --no-prefix-cache >/dev/null
+
 echo "=== prefix caching OFF ==="
 run prefix-off --no-prefix-cache
 echo "=== prefix caching ON ==="
