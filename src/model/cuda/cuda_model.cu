@@ -120,8 +120,14 @@ class CudaModel final : public Model {
                           cudaMemcpyHostToDevice));
     kv_dim_ = cfg_.num_key_value_heads * cfg_.head_dim;
     const size_t slots = static_cast<size_t>(kv.num_total_blocks()) * kv.block_size();
-    k_cache_.assign(cfg_.num_hidden_layers, std::vector<float>(slots * kv_dim_, 0.f));
-    v_cache_.assign(cfg_.num_hidden_layers, std::vector<float>(slots * kv_dim_, 0.f));
+    k_cache_.resize(cfg_.num_hidden_layers);
+    v_cache_.resize(cfg_.num_hidden_layers);
+    for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+      k_cache_[l] = device_alloc<__half>(slots * kv_dim_);
+      v_cache_[l] = device_alloc<__half>(slots * kv_dim_);
+      CUDA_CHECK(cudaMemset(k_cache_[l], 0, slots * kv_dim_ * sizeof(__half)));
+      CUDA_CHECK(cudaMemset(v_cache_[l], 0, slots * kv_dim_ * sizeof(__half)));
+    }
     report_memory();
   }
 
@@ -163,38 +169,34 @@ class CudaModel final : public Model {
     gate_.resize(static_cast<size_t>(N) * I);
     up_.resize(static_cast<size_t>(N) * I);
 
+    build_step_indices(N, bs);
+
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
       const CudaLayer& L = layers_[l];
-      float* kc = k_cache_[l].data();
-      float* vc = v_cache_[l].data();
 
       rmsnorm_device(x_.data(), L.in_norm_dev, h_.data(), N, H);
       linear(h_.data(), N, H, L.wq, H, L.bq, q_.data());
       linear(h_.data(), N, H, L.wk, kv_dim_, L.bk, k_.data());
       linear(h_.data(), N, H, L.wv, kv_dim_, L.bv, v_.data());
 
-      // Rotate q and k on the device, then write K/V into the cache. The cache
-      // write is still host-side; it fuses into this kernel once the cache
-      // itself lives on the device.
-      rope_device(q_.data(), N, nh, H);
-      rope_device(k_.data(), N, nkv, kv_dim_);
-      for (int i = 0; i < N; i++) {
-        const int pos = tok_pos_[i];
-        const int64_t slot = tok_seq_[i]->block_table.slot(pos, bs);
-        std::copy_n(&k_[static_cast<size_t>(i) * kv_dim_], kv_dim_,
-                    kc + static_cast<size_t>(slot) * kv_dim_);
-        std::copy_n(&v_[static_cast<size_t>(i) * kv_dim_], kv_dim_,
-                    vc + static_cast<size_t>(slot) * kv_dim_);
-      }
+      // Rotate q and k, scatter k and v into the cache, then attend. All three
+      // run on the device against the device-resident cache, so K and V for
+      // tokens that arrived in this same step are visible to each other, which
+      // is what makes a mixed prefill-and-decode step correct.
+      upload_half(d_q_, &d_q_cap_, q_.data(), static_cast<size_t>(N) * H);
+      upload_half(d_k_, &d_k_cap_, k_.data(), static_cast<size_t>(N) * kv_dim_);
+      upload_half(d_v_, &d_v_cap_, v_.data(), static_cast<size_t>(N) * kv_dim_);
 
-      for (int i = 0; i < N; i++) {
-        for (int hh = 0; hh < nh; hh++) {
-          ref::paged_attention_head(&q_[static_cast<size_t>(i) * H + hh * hd], kc, vc,
-                                    tok_seq_[i]->block_table, bs, tok_pos_[i], hh / group,
-                                    nkv, hd, scale,
-                                    &attn_[static_cast<size_t>(i) * H + hh * hd], scratch_);
-        }
-      }
+      launch_rope(d_q_, d_positions_, d_cos_, d_sin_, N, nh, hd, H, nullptr);
+      launch_rope(d_k_, d_positions_, d_cos_, d_sin_, N, nkv, hd, kv_dim_, nullptr);
+      launch_store_kv(d_k_, d_v_, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr);
+      ensure_capacity(&d_attn_, &d_attn_cap_, static_cast<size_t>(N) * H);
+      launch_attention_decode(d_q_, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
+                              d_token_seq_, d_positions_, d_attn_, N, nh, nkv, hd, bs,
+                              scale, nullptr);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+      download_half(d_attn_, attn_.data(), static_cast<size_t>(N) * H);
 
       linear(attn_.data(), N, H, L.wo, H, Tensor(), o_.data());
       for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
@@ -311,14 +313,6 @@ class CudaModel final : public Model {
     const size_t count = static_cast<size_t>(n_tokens) * row_stride;
     ensure_capacity(&dA_, &dA_cap_, count);
 
-    if (d_positions_cap_ < static_cast<size_t>(n_tokens)) {
-      if (d_positions_) CUDA_CHECK(cudaFree(d_positions_));
-      d_positions_ = device_alloc<int>(static_cast<size_t>(n_tokens));
-      d_positions_cap_ = static_cast<size_t>(n_tokens);
-    }
-    CUDA_CHECK(cudaMemcpy(d_positions_, tok_pos_.data(),
-                          static_cast<size_t>(n_tokens) * sizeof(int), cudaMemcpyHostToDevice));
-
     stage_a_.resize(count);
     for (size_t i = 0; i < count; i++) stage_a_[i] = f32_to_f16(x[i]);
     CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
@@ -331,6 +325,70 @@ class CudaModel final : public Model {
     stage_c_.resize(count);
     CUDA_CHECK(cudaMemcpy(stage_c_.data(), dA_, count * sizeof(__half), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < count; i++) x[i] = f16_to_f32(stage_c_[i]);
+  }
+
+  template <typename T>
+  void ensure_int_capacity(T** buf, size_t* cap, size_t need) {
+    if (*cap >= need) return;
+    if (*buf) CUDA_CHECK(cudaFree(*buf));
+    *buf = device_alloc<T>(need);
+    *cap = need;
+  }
+
+  void upload_half(__half*& buf, size_t* cap, const float* src, size_t n) {
+    ensure_capacity(&buf, cap, n);
+    stage_a_.resize(n);
+    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(src[i]);
+    CUDA_CHECK(cudaMemcpy(buf, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
+  }
+
+  void download_half(const __half* buf, float* dst, size_t n) {
+    stage_c_.resize(n);
+    CUDA_CHECK(cudaMemcpy(stage_c_.data(), buf, n * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < n; i++) dst[i] = f16_to_f32(stage_c_[i]);
+  }
+
+  // Everything the kernels need to know about where this step's tokens live:
+  // the slot each one writes to, which sequence it belongs to, and the block
+  // table of each distinct sequence. Built once per step rather than per layer.
+  void build_step_indices(int N, int bs) {
+    h_slots_.resize(N);
+    h_token_seq_.resize(N);
+    h_tables_.clear();
+    h_table_offset_.clear();
+
+    std::vector<const Sequence*> seen;
+    for (int i = 0; i < N; i++) {
+      const Sequence* s = tok_seq_[i];
+      int idx = -1;
+      for (size_t j = 0; j < seen.size(); j++)
+        if (seen[j] == s) { idx = static_cast<int>(j); break; }
+      if (idx < 0) {
+        idx = static_cast<int>(seen.size());
+        seen.push_back(s);
+        h_table_offset_.push_back(static_cast<int>(h_tables_.size()));
+        for (BlockId b : s->block_table.blocks) h_tables_.push_back(b);
+      }
+      h_token_seq_[i] = idx;
+      h_slots_[i] = static_cast<int>(s->block_table.slot(tok_pos_[i], bs));
+    }
+
+    ensure_int_capacity(&d_slots_, &d_slots_cap_, h_slots_.size());
+    ensure_int_capacity(&d_token_seq_, &d_token_seq_cap_, h_token_seq_.size());
+    ensure_int_capacity(&d_tables_, &d_tables_cap_, h_tables_.size());
+    ensure_int_capacity(&d_table_offset_, &d_table_offset_cap_, h_table_offset_.size());
+    ensure_int_capacity(&d_positions_, &d_positions_cap_, static_cast<size_t>(N));
+
+    CUDA_CHECK(cudaMemcpy(d_slots_, h_slots_.data(), h_slots_.size() * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_token_seq_, h_token_seq_.data(),
+                          h_token_seq_.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tables_, h_tables_.data(), h_tables_.size() * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_table_offset_, h_table_offset_.data(),
+                          h_table_offset_.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_positions_, tok_pos_.data(), static_cast<size_t>(N) * sizeof(int),
+                          cudaMemcpyHostToDevice));
   }
 
   void ensure_capacity(__half** buf, size_t* cap, size_t need) {
@@ -447,12 +505,26 @@ class CudaModel final : public Model {
   __half* d_x_ = nullptr;
   size_t d_x_cap_ = 0;
 
-  // The KV cache still lives on the host while attention is the reference
-  // implementation. It moves to the device with attention_decode.cu, and the
-  // layout is already the one the kernel will use:
-  // [slot][kv_head][head_dim], slot = block_table[pos / block_size] * block_size + pos % block_size.
+  // The KV cache lives on the device, laid out exactly as the CPU backend has
+  // it: [slot][kv_head][head_dim], with
+  // slot = block_table[pos / block_size] * block_size + pos % block_size.
+  // Identical layout means that formula is the same arithmetic on both sides,
+  // so a disagreement can never be the two backends organising memory
+  // differently.
   int kv_dim_ = 0;
-  std::vector<std::vector<float>> k_cache_, v_cache_;
+  std::vector<__half*> k_cache_, v_cache_;
+
+  // Per-step index arrays for the kernels. The block tables of every sequence
+  // in the step are concatenated once, rather than per token, because many
+  // tokens share a sequence.
+  std::vector<int> h_slots_, h_token_seq_, h_tables_, h_table_offset_;
+  int* d_slots_ = nullptr;
+  int* d_token_seq_ = nullptr;
+  int* d_tables_ = nullptr;
+  int* d_table_offset_ = nullptr;
+  size_t d_slots_cap_ = 0, d_token_seq_cap_ = 0, d_tables_cap_ = 0, d_table_offset_cap_ = 0;
+  __half *d_q_ = nullptr, *d_k_ = nullptr, *d_v_ = nullptr, *d_attn_ = nullptr;
+  size_t d_q_cap_ = 0, d_k_cap_ = 0, d_v_cap_ = 0, d_attn_cap_ = 0;
 
   // Per-token view of the step, identical to the CPU packing.
   std::vector<const Sequence*> tok_seq_;

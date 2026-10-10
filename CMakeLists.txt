@@ -60,6 +60,7 @@ set(ENGINE_CUDA_SOURCES
   src/kernels/rope.cu
   src/kernels/silu_mul.cu
   src/kernels/embedding.cu
+  src/kernels/store_kv.cu
   src/kernels/attention_decode.cu
   src/kernels/attention_prefill.cu
   src/kernels/sampling.cu

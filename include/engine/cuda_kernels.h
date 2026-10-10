@@ -33,6 +33,20 @@ void launch_rope(__half* x, const int* positions, const float* cos_table,
                  const float* sin_table, int n_tokens, int heads, int head_dim,
                  int row_stride, cudaStream_t stream);
 
+// Scatter k and v rows into their precomputed cache slots.
+void launch_store_kv(const __half* k, const __half* v, const int* slots,
+                     __half* k_cache, __half* v_cache, int n_tokens, int kv_dim,
+                     cudaStream_t stream);
+
+// Paged attention over the whole history of each token's own sequence.
+// block_tables is every sequence's table concatenated, table_offset indexes
+// into it, and token_seq maps a token to its sequence.
+void launch_attention_decode(const __half* q, const __half* k_cache, const __half* v_cache,
+                             const int* block_tables, const int* table_offset,
+                             const int* token_seq, const int* token_pos, __half* out,
+                             int n_tokens, int q_heads, int kv_heads, int head_dim,
+                             int block_size, float scale, cudaStream_t stream);
+
 }  // namespace engine
 
 #endif  // ENGINE_CUDA
