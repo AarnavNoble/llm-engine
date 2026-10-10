@@ -64,6 +64,9 @@ if have_gpu; then
 fi
 cmake -S . -B build -G Ninja "${CMAKE_ARGS[@]}" >/dev/null
 cmake --build build >/dev/null
+# Exported, not just set: the sub-scripts read it from the environment, and
+# without this they would quietly measure the CPU backend and label it cuda.
+export BACKEND
 echo "backend: $BACKEND"
 # Guard against the trap this script would otherwise hide: a run labelled cuda
 # that silently used the CPU backend.
