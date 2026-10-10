@@ -23,6 +23,9 @@ void launch_embedding(const __half* table, const int32_t* ids, __half* out,
 void launch_rmsnorm(const __half* x, const float* weight, __half* out,
                     int rows, int cols, float eps, cudaStream_t stream);
 
+// gate[i] = silu(gate[i]) * up[i], in place over n elements.
+void launch_silu_mul(__half* gate, const __half* up, size_t n, cudaStream_t stream);
+
 }  // namespace engine
 
 #endif  // ENGINE_CUDA

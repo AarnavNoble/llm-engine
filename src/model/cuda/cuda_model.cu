@@ -193,7 +193,7 @@ class CudaModel final : public Model {
       rmsnorm_device(x_.data(), L.post_norm_dev, h_.data(), N, H);
       linear(h_.data(), N, H, L.wgate, I, Tensor(), gate_.data());
       linear(h_.data(), N, H, L.wup, I, Tensor(), up_.data());
-      ref::silu_mul(gate_.data(), up_.data(), gate_.size());
+      silu_mul_device(gate_.data(), up_.data(), gate_.size());
       linear(gate_.data(), N, I, L.wdown, H, Tensor(), o_.data());
       for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
     }
@@ -273,6 +273,27 @@ class CudaModel final : public Model {
     stage_c_.resize(count);
     CUDA_CHECK(cudaMemcpy(stage_c_.data(), dC_, count * sizeof(__half), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
+  }
+
+  // Two inputs and one in-place output, so this one needs a second device
+  // buffer alongside the shared scratch.
+  void silu_mul_device(float* gate, const float* up, size_t n) {
+    ensure_capacity(&dA_, &dA_cap_, n);
+    ensure_capacity(&dC_, &dC_cap_, n);
+
+    stage_a_.resize(n);
+    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(gate[i]);
+    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
+    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(up[i]);
+    CUDA_CHECK(cudaMemcpy(dC_, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
+
+    launch_silu_mul(dA_, dC_, n, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    stage_c_.resize(n);
+    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dA_, n * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < n; i++) gate[i] = f16_to_f32(stage_c_[i]);
   }
 
   void ensure_capacity(__half** buf, size_t* cap, size_t need) {
