@@ -8,10 +8,35 @@ Writes bench/results/<tag>.json.
 
   python3 bench/loadgen.py --tag v0.1-baseline --concurrency 32 --num-requests 256
 """
-import argparse, asyncio, json, random, statistics, time, pathlib, re
+import argparse, asyncio, json, platform, random, re, statistics, subprocess, time, pathlib
 import aiohttp
 
 MIX = [(128, 0.5), (512, 0.3), (1024, 0.2)]
+
+
+def machine_label():
+    """A short description of this machine, for the results record.
+
+    The GPU if there is one, since that is what a GPU row is about, otherwise
+    the CPU. Best-effort: a label is worth more than a failed run, so every
+    probe is allowed to come back empty.
+    """
+    try:
+        g = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=10).stdout.strip()
+        if g:
+            return g.splitlines()[0].strip()
+    except Exception:
+        pass
+    try:
+        if platform.system() == "Darwin":
+            b = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+            if b:
+                return b
+    except Exception:
+        pass
+    return platform.processor() or platform.machine() or "unknown"
 
 
 def results_dir():
@@ -92,6 +117,13 @@ async def main(a):
     short = sorted(rec["per_request"], key=lambda r: r["out_len"])[: max(1, len(rec["per_request"]) // 3)]
     long_ = sorted(rec["per_request"], key=lambda r: -r["out_len"])[: max(1, len(rec["per_request"]) // 3)]
     res = {
+        # Every run records the machine it ran on. A results directory
+        # accumulates rows across machines -- the CPU rows here were taken on a
+        # laptop and the GPU rows on a rented A40 -- and a single
+        # hardware line above the table then claims one machine for all of
+        # them. The number has to travel with its hardware or the table
+        # misattributes it.
+        "machine": machine_label(),
         "tag": a.tag, "concurrency": a.concurrency, "num_requests": a.num_requests, "output_len": a.output_len,
         "output_dist": a.output_dist, "mean_output_len": sum(outs) / len(outs), "max_output_len": max(outs),
         "rate": a.rate,

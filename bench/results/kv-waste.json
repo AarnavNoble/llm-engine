@@ -1,19 +1,19 @@
 {
-  "workload": {"requests": 512, "mean_output_len": 128, "max_output_len": 777, "prompt_mix": "128/512/1024 at 50/30/20", "kv_slots": 65536, "block_size": 16, "max_model_len": 32768},
+  "workload": {"requests": 256, "mean_output_len": 128, "max_output_len": 1024, "prompt_mix": "128/512/1024 at 50/30/20", "kv_slots": 65536, "block_size": 16, "max_model_len": 32768},
   "results": [
-    {"strategy": "contiguous (reserve max_model_len)", "slot_utilization": 0.0168, "kv_waste_fraction": 0.9832, "mean_resident_seqs": 2.00, "mean_active_seqs": 1.35, "peak_resident_seqs": 2, "steps": 48885, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.4441, "kv_waste_fraction": 0.5559, "mean_resident_seqs": 51.40, "mean_active_seqs": 12.40, "peak_resident_seqs": 56, "steps": 5339, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.5552, "kv_waste_fraction": 0.4448, "mean_resident_seqs": 37.35, "mean_active_seqs": 37.35, "peak_resident_seqs": 57, "steps": 1772, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "paged, static batching", "slot_utilization": 0.9876, "kv_waste_fraction": 0.0124, "mean_resident_seqs": 63.70, "mean_active_seqs": 14.61, "peak_resident_seqs": 64, "steps": 4496, "preemptions": 0, "recomputed_tokens": 0},
-    {"strategy": "paged, continuous batching", "slot_utilization": 0.9881, "kv_waste_fraction": 0.0119, "mean_resident_seqs": 41.51, "mean_active_seqs": 41.12, "peak_resident_seqs": 64, "steps": 1597, "preemptions": 0, "recomputed_tokens": 0}
+    {"strategy": "contiguous (reserve max_model_len)", "slot_utilization": 0.0169, "kv_waste_fraction": 0.9831, "mean_resident_seqs": 2.00, "mean_active_seqs": 1.29, "peak_resident_seqs": 2, "steps": 24327, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.3520, "kv_waste_fraction": 0.6480, "mean_resident_seqs": 42.01, "mean_active_seqs": 8.45, "peak_resident_seqs": 47, "steps": 3702, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "contiguous (reserve prompt + max_tokens)", "slot_utilization": 0.5477, "kv_waste_fraction": 0.4523, "mean_resident_seqs": 20.21, "mean_active_seqs": 20.21, "peak_resident_seqs": 47, "steps": 1548, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "paged, static batching", "slot_utilization": 0.9863, "kv_waste_fraction": 0.0137, "mean_resident_seqs": 63.75, "mean_active_seqs": 11.67, "peak_resident_seqs": 64, "steps": 2659, "preemptions": 0, "recomputed_tokens": 0},
+    {"strategy": "paged, continuous batching", "slot_utilization": 0.9898, "kv_waste_fraction": 0.0102, "mean_resident_seqs": 23.09, "mean_active_seqs": 22.86, "peak_resident_seqs": 64, "steps": 1357, "preemptions": 0, "recomputed_tokens": 0}
   ],
   "pressure_sweep": [
-    {"blocks": 256, "kv_slots": 4096, "fits": true, "preemptions_no_watermark": 162, "wasted_no_watermark": 0.1919, "preemptions_watermark": 65, "wasted_watermark": 0.0907},
-    {"blocks": 384, "kv_slots": 6144, "fits": true, "preemptions_no_watermark": 134, "wasted_no_watermark": 0.1536, "preemptions_watermark": 35, "wasted_watermark": 0.0549},
-    {"blocks": 512, "kv_slots": 8192, "fits": true, "preemptions_no_watermark": 135, "wasted_no_watermark": 0.1618, "preemptions_watermark": 15, "wasted_watermark": 0.0233},
-    {"blocks": 768, "kv_slots": 12288, "fits": true, "preemptions_no_watermark": 141, "wasted_no_watermark": 0.1667, "preemptions_watermark": 14, "wasted_watermark": 0.0189},
-    {"blocks": 1024, "kv_slots": 16384, "fits": true, "preemptions_no_watermark": 150, "wasted_no_watermark": 0.1695, "preemptions_watermark": 2, "wasted_watermark": 0.0010},
-    {"blocks": 2048, "kv_slots": 32768, "fits": true, "preemptions_no_watermark": 87, "wasted_no_watermark": 0.1010, "preemptions_watermark": 0, "wasted_watermark": 0.0000},
+    {"blocks": 256, "kv_slots": 4096, "fits": true, "preemptions_no_watermark": 80, "wasted_no_watermark": 0.1826, "preemptions_watermark": 26, "wasted_watermark": 0.0854},
+    {"blocks": 384, "kv_slots": 6144, "fits": true, "preemptions_no_watermark": 66, "wasted_no_watermark": 0.1592, "preemptions_watermark": 9, "wasted_watermark": 0.0355},
+    {"blocks": 512, "kv_slots": 8192, "fits": true, "preemptions_no_watermark": 64, "wasted_no_watermark": 0.1710, "preemptions_watermark": 11, "wasted_watermark": 0.0467},
+    {"blocks": 768, "kv_slots": 12288, "fits": true, "preemptions_no_watermark": 61, "wasted_no_watermark": 0.1330, "preemptions_watermark": 7, "wasted_watermark": 0.0153},
+    {"blocks": 1024, "kv_slots": 16384, "fits": true, "preemptions_no_watermark": 49, "wasted_no_watermark": 0.1330, "preemptions_watermark": 0, "wasted_watermark": 0.0000},
+    {"blocks": 2048, "kv_slots": 32768, "fits": true, "preemptions_no_watermark": 23, "wasted_no_watermark": 0.0757, "preemptions_watermark": 0, "wasted_watermark": 0.0000},
     {"blocks": 4096, "kv_slots": 65536, "fits": true, "preemptions_no_watermark": 0, "wasted_no_watermark": 0.0000, "preemptions_watermark": 0, "wasted_watermark": 0.0000}
   ]
 }

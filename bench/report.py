@@ -57,11 +57,18 @@ def environment():
 
 
 def provenance_line():
+    """Describes the machine of the most recent full run, and says so.
+
+    It deliberately does not say 'measured on', because rows older than that
+    run were measured elsewhere. Each row carries its own hardware instead.
+    """
     e = environment()
     if not e:
-        return "_Hardware not recorded for these results._"
+        return "_Hardware not recorded for the last run._"
     bits = [b for b in (e.get("gpu"), e.get("cpu"), e.get("cuda"), e.get("driver")) if b]
-    return "_Measured on " + ", ".join(bits) + f". Commit `{e.get('commit', 'unknown')}`._"
+    return ("_Last full run on " + ", ".join(bits) + f", commit `{e.get('commit', 'unknown')}`. "
+            "Each row below names the machine it was measured on; rows may come "
+            "from different machines._")
 
 
 def med(runs, key):
@@ -93,6 +100,19 @@ def serving_rows():
         if not runs:
             rows.append((label, note, None, None, None, None, None, 0))
             continue
+        # The hardware travels with the row, not with the table. A results
+        # directory accumulates rows measured on different machines -- the CPU
+        # rows here were taken on a laptop and the GPU rows on a rented A40 --
+        # and one hardware line above the table silently claims a single
+        # machine for all of them.
+        machines = sorted({r["machine"] for r in runs if r.get("machine")})
+        # A backfilled label was derived afterwards from the run's env.json
+        # rather than recorded by the run itself, and says so.
+        back = any(r.get("machine_backfilled") for r in runs)
+        if machines:
+            note = note + " · " + ", ".join(machines) + (" (backfilled)" if back else "")
+        else:
+            note = note + " · hardware not recorded"
         rows.append((label, note, med(runs, "tokens_per_s"), med(runs, "ttft_p50_ms"),
                      med(runs, "ttft_p95_ms"), med(runs, "itl_p50_ms"), med(runs, "itl_p95_ms"),
                      len(runs)))

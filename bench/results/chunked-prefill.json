@@ -3,33 +3,39 @@
     "chunk": 2048,
     "streams": 4,
     "prompt_tokens": 2048,
-    "itl_p50_ms": 91.79695812053978,
-    "itl_p95_ms": 561.3206818583421,
-    "itl_max_ms": 23203.45441601239,
-    "itl_p50_before_ms": 90.8293129177764,
-    "itl_max_after_ms": 23203.45441601239,
-    "long_prompt_ttft_s": 23.814704041928053
+    "itl_p50_ms": 12.921943503897637,
+    "itl_p95_ms": 16.16122863488272,
+    "itl_max_ms": 47.782141948118806,
+    "itl_p50_before_ms": 12.921943503897637,
+    "itl_max_after_ms": NaN,
+    "long_prompt_ttft_s": 1.3619319219142199,
+    "machine": "NVIDIA A40",
+    "machine_backfilled": "from env.json of the same reproduce.sh run"
   },
   {
     "chunk": 512,
     "streams": 4,
     "prompt_tokens": 2048,
-    "itl_p50_ms": 88.9185625128448,
-    "itl_p95_ms": 6812.715048191603,
-    "itl_max_ms": 9750.11874991469,
-    "itl_p50_before_ms": 87.02016691677272,
-    "itl_max_after_ms": 9750.11874991469,
-    "long_prompt_ttft_s": 23.63352254102938
+    "itl_p50_ms": 12.982784421183169,
+    "itl_p95_ms": 13.437079556751996,
+    "itl_max_ms": 37.27358498144895,
+    "itl_p50_before_ms": 12.982784421183169,
+    "itl_max_after_ms": NaN,
+    "long_prompt_ttft_s": 1.3797249499475583,
+    "machine": "NVIDIA A40",
+    "machine_backfilled": "from env.json of the same reproduce.sh run"
   },
   {
     "chunk": 128,
     "streams": 4,
     "prompt_tokens": 2048,
-    "itl_p50_ms": 91.45027096383274,
-    "itl_p95_ms": 1653.229225461837,
-    "itl_max_ms": 1968.5571249574423,
-    "itl_p50_before_ms": 90.027250116691,
-    "itl_max_after_ms": 1968.5571249574423,
-    "long_prompt_ttft_s": 24.686287542106584
+    "itl_p50_ms": 12.85729103256017,
+    "itl_p95_ms": 13.310775597346947,
+    "itl_max_ms": 36.84593003708869,
+    "itl_p50_before_ms": 12.85729103256017,
+    "itl_max_after_ms": NaN,
+    "long_prompt_ttft_s": 1.4565442060120404,
+    "machine": "NVIDIA A40",
+    "machine_backfilled": "from env.json of the same reproduce.sh run"
   }
 ]
