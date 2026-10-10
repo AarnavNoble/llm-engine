@@ -108,8 +108,11 @@ env = {
     "gpu": gpu.replace(", ", " ") if gpu else None,
     "driver": (lambda d: f"driver {d}" if d else None)(
         sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader")),
-    "cuda": (lambda v: f"CUDA {v.split()[-1]}" if v else None)(
-        sh("nvcc --version | tail -1")),
+    # 'nvcc --version | tail -1' is the Build line, whose last field is
+    # cuda_12.8.r12.8/compiler.35583870_0 -- a build id, not a version. The
+    # release line carries the number a reader wants.
+    "cuda": (lambda v: f"CUDA {v}" if v else None)(
+        sh("nvcc --version | sed -n 's/.*release \\([0-9.]*\\).*/\\1/p'")),
     "cpu": sh("lscpu | sed -n 's/^Model name: *//p'") or platform.processor() or None,
     "os": platform.platform(),
     "commit": sh("git rev-parse --short HEAD"),
