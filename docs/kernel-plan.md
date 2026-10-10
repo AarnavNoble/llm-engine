@@ -276,8 +276,23 @@ just the golden check.
 ## 7. `sampling.cu`
 
 **Computes** greedy or top-p over `[rows, vocab]`, on device, so logits never
-cross PCIe. At vocab 151936 and fp32 that is 600 KB per row per step; moving it
-to the host is a real cost at small batch sizes.
+cross PCIe.
+
+This section used to say fp32 and 600 KB per row. The lm_head GEMM writes
+`__half` (`cuda_model.cu:289`), so it is 297 KiB, and the host widens on
+arrival -- which means the host sampler has always been reading fp16-rounded
+values, and a device sampler taking `__half` is what makes the two comparable
+rather than merely close.
+
+More importantly the transfer is the small term, so "never cross PCIe" is the
+wrong reason to want this. Into an unpinned `std::vector` the copy is tens of
+microseconds per row. What follows it on the engine thread, serially, is not:
+`f16_to_f32` is a branchy software conversion with a normalisation loop for
+subnormals (`tensor.h:29`), run once per vocabulary entry per row, and when
+`top_p < 1` the host sorts all 151936 indices through an indirect comparator
+(`sampler.cpp:30`). That is the cost, it is CPU work rather than bandwidth, and
+because it sits on the engine thread it caps throughput at every batch size
+instead of only hurting latency at batch 1.
 
 **Greedy.** Block reduction for argmax over the row, then a reduce across blocks.
 Tie-break on the lowest index to match `Sampler::argmax`, or the comparison
