@@ -136,6 +136,10 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
       return;
     }
     auto sub = engine_.submit(prompt, params, [ch](const Sequence&, int32_t t, FinishReason r) { ch->push(t, r); });
+    if (const std::string fatal = engine_.fatal_error(); !fatal.empty()) {
+      write_error(res, 503, "engine is not running: " + fatal);
+      return;
+    }
     if (!sub.ok()) {
       // 429 for overload and 503 for draining are different instructions to the
       // client: back off and retry, versus this instance is going away.

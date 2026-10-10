@@ -125,6 +125,13 @@ HealthReport Engine::health() const {
     h.alive = false;
     h.problems.push_back("no step completed in " + std::to_string(h.seconds_since_progress) + "s");
   }
+  {
+    std::lock_guard<std::mutex> g(fatal_mu_);
+    if (!fatal_error_.empty()) {
+      h.alive = false;
+      h.problems.push_back("step loop died: " + fatal_error_);
+    }
+  }
   if (!invariants_ok_) {
     // The block pool accounting does not add up, which means the allocator has
     // leaked or double-counted. Results past this point are not trustworthy.
@@ -202,7 +209,39 @@ void Engine::refresh_gauges() {
   metrics_.kv_evictions = kv_.stats().evictions;
 }
 
+std::string Engine::fatal_error() const {
+  std::lock_guard<std::mutex> g(fatal_mu_);
+  return fatal_error_;
+}
+
 void Engine::run() {
+  try {
+    run_loop();
+  } catch (const std::exception& e) {
+    // A backend error is fatal to this process: the model state is unknown, so
+    // the honest move is to stop accepting work, fail health, release every
+    // waiting client, and say what happened. Letting it escape the thread would
+    // call std::terminate with no context at all.
+    {
+      std::lock_guard<std::mutex> g(fatal_mu_);
+      fatal_error_ = e.what();
+    }
+    std::fprintf(stderr, "engine: step loop died: %s\n", e.what());
+    std::fflush(stderr);
+    accepting_ = false;
+    ready_ = false;
+    running_ = false;
+    for (auto& s : std::vector<SequencePtr>(scheduler_.running())) scheduler_.abort(s->id);
+    while (scheduler_.num_waiting() > 0) {
+      auto st = scheduler_.schedule();
+      for (auto& sl : st.slices) scheduler_.abort(sl.seq->id);
+      if (st.empty()) break;
+    }
+    refresh_gauges();
+  }
+}
+
+void Engine::run_loop() {
   mark_progress();
   std::vector<float> logits;
   const int vocab = model_->config().vocab_size;

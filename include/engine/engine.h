@@ -65,6 +65,11 @@ struct HealthReport {
   double seconds_since_progress = 0;
 };
 
+// The last fatal error from the step loop, empty when there has not been one.
+// A backend failure (a CUDA error, say) kills the loop, and the process should
+// report that rather than calling std::terminate from a thread nobody is
+// watching.
+
 class Engine {
  public:
   explicit Engine(EngineConfig cfg);
@@ -91,9 +96,13 @@ class Engine {
   bool ready() const { return ready_; }
   // True when the binary was built with the CUDA backend compiled in.
   static bool cuda_available();
+  // Empty unless the step loop died. Set before the loop exits, so a caller
+  // that notices requests failing can say why.
+  std::string fatal_error() const;
 
  private:
   void run();
+  void run_loop();
   void refresh_gauges();
 
   EngineConfig cfg_;
@@ -118,6 +127,8 @@ class Engine {
   std::atomic<bool> invariants_ok_{true};
   std::atomic<int64_t> queued_{0};
   void mark_progress();
+  std::string fatal_error_;          // guarded by inbox_mu_
+  mutable std::mutex fatal_mu_;
 };
 
 }  // namespace engine
