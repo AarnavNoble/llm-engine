@@ -30,6 +30,7 @@ tables, with the protocol and what each figure does and does not mean, are in
 | Continuous vs static batching, throughput | **1.47x** | 10-core Mac, CPU |
 | Chunked prefill, worst decode stall, same experiment | **11.8x smaller** (23.2 s to 2.0 s) | 10-core Mac, CPU |
 | Admission watermark, preemption recompute waste | **16.2% to 2.3%** of all token work, at 0.7% occupancy cost | hardware independent |
+| vLLM on the same model and GPU | **5,927 tok/s** against this engine's 386 | A40, CUDA |
 
 Three of these are worth reading twice, because they are not the result the
 design predicted.
@@ -50,8 +51,21 @@ the CPU backend and is worth 1.3x here, for the same reason: a 2,048-token
 prefill takes about 37 ms on an A40, so there is barely a stall left to
 subtract. It would matter again with a larger model or longer prompts.
 
-Per-kernel bandwidth against the card's peak, a vLLM reference row, and the
-optimisation rows are not measured. They are rendered as *not measured* on the
+**vLLM is 15x faster, and that row is in the table on purpose.** A comparison
+nobody runs is worth less than one that is unflattering, and the shape of the
+gap says where the work is: inter-token latency is 23x apart while
+time-to-first-token is only 5x, which points at the per-step cost rather than
+at scheduling or paging. The largest known contributor is that every step
+copies 32 x 151,936 fp16 logits to the host and widens them with a branchy
+software conversion before sampling, on the engine thread, while the GPU
+waits. vLLM also uses CUDA graphs, tensor-core attention and fused kernels,
+none of which are implemented here.
+
+Per-kernel bandwidth against the card's peak is still unmeasured: Nsight
+Compute needs `NVreg_RestrictProfilingToAdminUsers=0`, a host kernel-module
+parameter that a rented container cannot set, so `ncu` returns
+`ERR_NVGPUCTRPERM`. The optimisation rows are unmeasured because the
+optimisations are unwritten. Both are rendered as *not measured* on the
 results page rather than estimated, and `bench/report.py` fails rather than
 publishing a figure with no data behind it.
 

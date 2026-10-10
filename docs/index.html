@@ -46,7 +46,7 @@ Paged KV cache, continuous batching, prefix caching, OpenAI-compatible streaming
 <tr class="pending"><td>engine, + prefix caching</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
 <tr class="pending"><td>engine, + fused kernels</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
 <tr class="pending"><td>engine, + CUDA graphs</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
-<tr class="pending"><td>vLLM, same model and GPU</td><td>reference</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr><td>vLLM, same model and GPU</td><td>reference · NVIDIA A40</td><td>5,927.5</td><td>31 ms</td><td>173 ms</td><td>3.5 ms</td><td>8.7 ms</td><td>3</td></tr>
 </tbody></table></div>
 <h2>KV cache efficiency</h2>
 <p>Allocator property, measured with a fake model, so it is hardware independent. 256 requests, 65,536 KV token slots (4096 blocks of 16), outputs around 128 tokens.</p>

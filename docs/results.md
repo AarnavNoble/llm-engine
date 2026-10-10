@@ -18,7 +18,7 @@ Qwen2.5-0.5B-Instruct, 32 concurrent requests, prompt mix 128/512/1024 at 50/30/
 | engine, + prefix caching | CUDA backend | not measured | not measured | not measured | not measured | not measured | - |
 | engine, + fused kernels | CUDA backend | not measured | not measured | not measured | not measured | not measured | - |
 | engine, + CUDA graphs | CUDA backend | not measured | not measured | not measured | not measured | not measured | - |
-| vLLM, same model and GPU | reference | not measured | not measured | not measured | not measured | not measured | - |
+| vLLM, same model and GPU | reference · NVIDIA A40 | 5,927.5 | 31 ms | 173 ms | 3.5 ms | 8.7 ms | 3 |
 
 ## KV cache efficiency
 
