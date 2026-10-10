@@ -41,18 +41,30 @@ Rules: stop the pod whenever you walk away; keep everything on the persistent vo
    scripts/download_model.sh
    python3 reference/dump_logits.py       # writes tests/data/ref/*.bin
    ```
-5. **Build + test**:
+5. **Golden tensors for kernel work** (do this before writing any kernel):
+   ```bash
+   cmake -S . -B build -G Ninja && cmake --build build
+   ./build/golden_dump --out tests/data/golden      # per-operation input/output pairs
+   ./build/tests/engine_tests "[golden]"            # harness green against the CPU reference
+   ```
+   Each kernel then gets a test that is `tests/test_golden_ops.cpp` with the
+   reference call swapped for a launch, so a wrong kernel points at itself
+   instead of at the end of a 24-layer forward pass. The reference each kernel
+   must match lives in `include/engine/ops.h`, and it is the same code the CPU
+   model runs, so it cannot drift from what was verified against PyTorch.
+
+6. **Build + test**:
    ```bash
    cmake -S . -B build -G Ninja -DENGINE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
    cmake --build build && ./build/tests/engine_tests
    ./build/engine serve --model models/Qwen2.5-0.5B-Instruct --backend cuda
    ```
-6. **Profiling**:
+7. **Profiling**:
    ```bash
    nsys profile -o docs/prof/decode ./build/engine generate --backend cuda --model models/Qwen2.5-0.5B-Instruct --prompt "hi" --max-tokens 64
    ncu --set full -k regex:attention_decode -c 3 ./build/engine generate --backend cuda --model models/Qwen2.5-0.5B-Instruct --prompt "hi" --max-tokens 8
    ```
-7. **Sanitizers.** Run these once on the Linux box, because they do not work on
+8. **Sanitizers.** Run these once on the Linux box, because they do not work on
    the Mac: ThreadSanitizer segfaults on a two-thread hello world under macOS 26
    on arm64, and the Address/UB build hangs during configuration. The Engine is
    the only multi-threaded component (HTTP threads submit and abort, the engine
@@ -63,6 +75,6 @@ Rules: stop the pod whenever you walk away; keep everything on the persistent vo
    cmake --build build-tsan && ./build-tsan/tests/engine_tests "[model]"
    # and again with -fsanitize=address,undefined
    ```
-8. **Budget**: ~40 GPU-hours total. `runpodctl stop pod <id>` (or the web button) every time.
+9. **Budget**: ~40 GPU-hours total. `runpodctl stop pod <id>` (or the web button) every time.
 
 Colab fallback: T4 is sm_75 — build with `-DCMAKE_CUDA_ARCHITECTURES=75`; no bf16, so fp16 only. Fine for the first kernels, not for the published numbers.

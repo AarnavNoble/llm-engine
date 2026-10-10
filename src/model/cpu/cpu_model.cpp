@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "engine/model.h"
+#include "engine/ops.h"
 #include "engine/parallel.h"
 #include "engine/safetensors.h"
 
@@ -37,14 +38,7 @@ void linear(const float* A, int m, int k, const float* B, int n, const float* bi
   if (bias) for (int i = 0; i < m; i++) for (int j = 0; j < n; j++) C[static_cast<size_t>(i) * n + j] += bias[j];
 }
 
-void rmsnorm(const float* x, const float* w, float* out, int rows, int h, float eps) {
-  for (int r = 0; r < rows; r++) {
-    const float* xr = x + static_cast<size_t>(r) * h; float* o = out + static_cast<size_t>(r) * h;
-    double ss = 0; for (int i = 0; i < h; i++) ss += static_cast<double>(xr[i]) * xr[i];
-    float inv = 1.0f / std::sqrt(static_cast<float>(ss / h) + eps);
-    for (int i = 0; i < h; i++) o[i] = xr[i] * inv * w[i];
-  }
-}
+using ref::rmsnorm;
 
 struct Layer {
   Tensor in_norm, post_norm, wq, wk, wv, wo, bq, bk, bv, wgate, wup, wdown;
@@ -84,16 +78,8 @@ class CpuModel final : public Model {
       L.wdown = w.get(p + "mlp.down_proj.weight").to_f32();
     }
     // RoPE tables for every position we can ever see.
-    const int hd = cfg_.head_dim, half = hd / 2, P = cfg_.max_position_embeddings;
-    cos_.assign(static_cast<size_t>(P) * half, 0.f); sin_.assign(static_cast<size_t>(P) * half, 0.f);
-    for (int i = 0; i < half; i++) {
-      double inv_freq = 1.0 / std::pow(static_cast<double>(cfg_.rope_theta), (2.0 * i) / hd);
-      for (int p = 0; p < P; p++) {
-        double a = p * inv_freq;
-        cos_[static_cast<size_t>(p) * half + i] = static_cast<float>(std::cos(a));
-        sin_[static_cast<size_t>(p) * half + i] = static_cast<float>(std::sin(a));
-      }
-    }
+    const int hd = cfg_.head_dim;
+    rope_.build(hd, cfg_.max_position_embeddings, cfg_.rope_theta);
     // Paged KV cache: [layer][slot][kv_head][head_dim]
     const size_t slots = static_cast<size_t>(kv.num_total_blocks()) * kv.block_size();
     kv_dim_ = cfg_.num_key_value_heads * hd;
@@ -136,6 +122,7 @@ class CpuModel final : public Model {
       std::memcpy(x_.data() + static_cast<size_t>(i) * H,
                   embed_.ptr() + static_cast<size_t>(tok_id_[i]) * H, sizeof(float) * H);
     if (opts_.on_layer) opts_.on_layer(-1, x_.data(), N);
+    tap({Tap::Embedding, -1, N, H, x_.data()});
 
     h_.resize(static_cast<size_t>(N) * H); q_.resize(static_cast<size_t>(N) * H);
     k_.resize(static_cast<size_t>(N) * kv_dim_); v_.resize(static_cast<size_t>(N) * kv_dim_);
@@ -148,16 +135,21 @@ class CpuModel final : public Model {
       float* vc = v_cache_[l].data();
 
       rmsnorm(x_.data(), L.in_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      tap({Tap::InputNorm, l, N, H, h_.data()});
       linear(h_.data(), N, H, L.wq.ptr(), H, L.bq.numel() ? L.bq.ptr() : nullptr, q_.data());
       linear(h_.data(), N, H, L.wk.ptr(), kv_dim_, L.bk.numel() ? L.bk.ptr() : nullptr, k_.data());
       linear(h_.data(), N, H, L.wv.ptr(), kv_dim_, L.bv.numel() ? L.bv.ptr() : nullptr, v_.data());
+      tap({Tap::QkvProj, l, N, H, q_.data(), k_.data(), v_.data(), kv_dim_, kv_dim_});
 
       // Rotate and write K/V for every token first, so tokens that arrived in
-      // this same step can attend to each other.
+      // this same step can attend to each other. The rope tap fires after the
+      // rotation and before the cache write, because the CUDA version fuses
+      // those two and still has to reproduce this intermediate.
       for (int i = 0; i < N; i++) {
         const int pos = tok_pos_[i];
         apply_rope(q_.data() + static_cast<size_t>(i) * H, nh, pos);
         apply_rope(k_.data() + static_cast<size_t>(i) * kv_dim_, nkv, pos);
+        if (i + 1 == N) tap({Tap::Rope, l, N, H, q_.data(), k_.data(), nullptr, kv_dim_, 0});
         const int64_t slot = tok_seq_[i]->block_table.slot(pos, bs);
         std::memcpy(kc + static_cast<size_t>(slot) * kv_dim_,
                     k_.data() + static_cast<size_t>(i) * kv_dim_, sizeof(float) * kv_dim_);
@@ -182,42 +174,30 @@ class CpuModel final : public Model {
         std::vector<float> scores;
         for (int64_t w = begin; w < end; w++) {
           const int i = static_cast<int>(w / nh), h = static_cast<int>(w % nh);
-          const int pos = tok_pos_[i];
-          const BlockTable& bt = tok_seq_[i]->block_table;
-          const int kvh = h / group;
-          const float* q = q_.data() + static_cast<size_t>(i) * H + h * hd;
-          scores.resize(static_cast<size_t>(pos) + 1);
-          float mx = -INFINITY;
-          for (int p = 0; p <= pos; p++) {
-            const float* k = kc + static_cast<size_t>(bt.slot(p, bs)) * kv_dim_ + kvh * hd;
-            float sc = 0.f;
-            for (int d = 0; d < hd; d++) sc += q[d] * k[d];
-            sc *= scale; scores[p] = sc; if (sc > mx) mx = sc;
-          }
-          double denom = 0;
-          for (int p = 0; p <= pos; p++) { scores[p] = std::exp(scores[p] - mx); denom += scores[p]; }
-          float* out = attn_.data() + static_cast<size_t>(i) * H + h * hd;
-          for (int d = 0; d < hd; d++) out[d] = 0.f;
-          for (int p = 0; p <= pos; p++) {
-            const float wgt = static_cast<float>(scores[p] / denom);
-            const float* vv = vc + static_cast<size_t>(bt.slot(p, bs)) * kv_dim_ + kvh * hd;
-            for (int d = 0; d < hd; d++) out[d] += wgt * vv[d];
-          }
+          ref::paged_attention_head(
+              q_.data() + static_cast<size_t>(i) * H + h * hd, kc, vc,
+              tok_seq_[i]->block_table, bs, tok_pos_[i], h / group, nkv, hd, scale,
+              attn_.data() + static_cast<size_t>(i) * H + h * hd, scores);
         }
       };
       const int64_t total_items = static_cast<int64_t>(N) * nh;
       if (attn_work >= kAttentionThreadThreshold) pool_.parallel_for(total_items, attention_body);
       else attention_body(0, total_items);
 
+      tap({Tap::AttnOut, l, N, H, attn_.data()});
       linear(attn_.data(), N, H, L.wo.ptr(), H, nullptr, o_.data());
       for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
+      tap({Tap::AttnResidual, l, N, H, x_.data()});
 
       rmsnorm(x_.data(), L.post_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      tap({Tap::PostNorm, l, N, H, h_.data()});
       linear(h_.data(), N, H, L.wgate.ptr(), I, nullptr, gate_.data());
       linear(h_.data(), N, H, L.wup.ptr(), I, nullptr, up_.data());
-      for (size_t i = 0; i < gate_.size(); i++) { float g = gate_[i]; gate_[i] = g / (1.0f + std::exp(-g)) * up_[i]; }
+      ref::silu_mul(gate_.data(), up_.data(), gate_.size());
+      tap({Tap::SiluMul, l, N, I, gate_.data()});
       linear(gate_.data(), N, I, L.wdown.ptr(), H, nullptr, o_.data());
       for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
+      tap({Tap::LayerOut, l, N, H, x_.data()});
       if (opts_.on_layer) opts_.on_layer(l, x_.data(), N);
     }
 
@@ -230,22 +210,14 @@ class CpuModel final : public Model {
               h_.data() + static_cast<size_t>(r) * H, 1, H, cfg_.rms_norm_eps);
     const Tensor& head = cfg_.tie_word_embeddings ? embed_ : lm_head_;
     linear(h_.data(), R, H, head.ptr(), cfg_.vocab_size, nullptr, logits.data());
+    tap({Tap::Logits, -1, R, cfg_.vocab_size, logits.data()});
   }
 
+  void tap(const TapData& d) const { if (opts_.on_tap) opts_.on_tap(d); }
+
  private:
-  // RoPE in the HF "rotate_half" convention: pairs (i, i + half).
   void apply_rope(float* x, int heads, int pos) const {
-    const int hd = cfg_.head_dim, half = hd / 2;
-    const float* c = cos_.data() + static_cast<size_t>(pos) * half;
-    const float* s = sin_.data() + static_cast<size_t>(pos) * half;
-    for (int h = 0; h < heads; h++) {
-      float* v = x + h * hd;
-      for (int i = 0; i < half; i++) {
-        float a = v[i], b = v[i + half];
-        v[i] = a * c[i] - b * s[i];
-        v[i + half] = b * c[i] + a * s[i];
-      }
-    }
+    ref::rope_inplace(x, heads, cfg_.head_dim, pos, rope_);
   }
 
   ModelConfig cfg_;
@@ -253,7 +225,7 @@ class CpuModel final : public Model {
   CpuModelOptions opts_;
   Tensor embed_, final_norm_, lm_head_;
   std::vector<Layer> layers_;
-  std::vector<float> cos_, sin_;
+  ref::RopeTables rope_;
   int kv_dim_ = 0;
   std::vector<std::vector<float>> k_cache_, v_cache_;
   // scratch, reused across steps

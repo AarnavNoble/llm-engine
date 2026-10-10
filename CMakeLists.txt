@@ -97,6 +97,11 @@ if(ENGINE_CUDA)
 endif()
 
 if(ENGINE_BENCH)
+  # Per-operation golden tensors, so each CUDA kernel can be verified on its own
+  # rather than by diffing the end of a 24-layer forward pass.
+  add_executable(golden_dump src/golden_dump.cpp)
+  target_link_libraries(golden_dump PRIVATE engine_core)
+
   # KV-cache efficiency is a property of the allocator, not of the GPU, so it is
   # measured with a fake model on any machine.
   add_executable(kv_waste bench/kv_waste.cpp)

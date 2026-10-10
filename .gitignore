@@ -2,6 +2,7 @@ build/
 build-*/
 models/
 tests/data/*/ref/
+tests/data/golden/
 bench/results/*.raw
 __pycache__/
 *.pyc
