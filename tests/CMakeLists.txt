@@ -12,6 +12,7 @@ add_executable(engine_tests
   test_sampler.cpp
   test_metrics.cpp
   test_cpu_model.cpp
+  test_cuda_model.cpp
   test_golden_ops.cpp
   test_engine_concurrency.cpp
 )

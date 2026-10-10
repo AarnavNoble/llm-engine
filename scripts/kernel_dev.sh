@@ -63,8 +63,8 @@ run_once() {
   fi
 
   if [ "$FULL" = 1 ]; then
-    printf "\n\033[1m== full per-layer comparison against PyTorch\033[0m\n"
-    "./$BUILD/tests/engine_tests" "[model]" 2>&1 | tail -20
+    printf "\n\033[1m== full comparison against PyTorch\033[0m\n"
+    "./$BUILD/tests/engine_tests" "[model]" 2>&1 | tail -24
   fi
   return 0
 }
