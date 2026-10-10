@@ -133,8 +133,6 @@ class StepProfile {
     if (on_) report();
     for (cudaEvent_t e : pool_) cudaEventDestroy(e);
   }
-  bool on() const { return on_; }
-
   void begin(int region) { if (on_) { open_ = region; start_ = mark(); } }
   void end() { if (on_) spans_.push_back({open_, start_, mark()}); }
 
@@ -160,7 +158,7 @@ class StepProfile {
   struct Span { int region, a, b; };
 
   int mark() {
-    if (next_ == pool_.size()) {
+    if (next_ == static_cast<int>(pool_.size())) {
       cudaEvent_t e = nullptr;
       if (cudaEventCreate(&e) != cudaSuccess) return next_;  // give up quietly
       pool_.push_back(e);
