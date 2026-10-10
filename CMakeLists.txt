@@ -84,17 +84,20 @@ if(ENGINE_CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "sm_89 = RTX 4090")
   find_package(CUDAToolkit REQUIRED)
-  add_library(engine_cuda ${ENGINE_CUDA_SOURCES})
+  # An OBJECT library rather than a static one: engine_core calls
+  # make_cuda_model, which lives here, while this needs engine_core's headers.
+  # Two static archives in that cycle do not resolve in one link pass, so the
+  # objects go straight into the final binaries instead.
+  add_library(engine_cuda OBJECT ${ENGINE_CUDA_SOURCES})
   target_include_directories(engine_cuda PUBLIC include)
-  target_link_libraries(engine_cuda PUBLIC engine_core CUDA::cudart CUDA::cublas)
+  target_link_libraries(engine_cuda PUBLIC CUDA::cudart CUDA::cublas
+                        nlohmann_json::nlohmann_json)
   target_compile_definitions(engine_core PUBLIC ENGINE_CUDA=1)
+  target_link_libraries(engine_core PUBLIC engine_cuda)
 endif()
 
 add_executable(engine src/main.cpp)
 target_link_libraries(engine PRIVATE engine_core)
-if(ENGINE_CUDA)
-  target_link_libraries(engine PRIVATE engine_cuda)
-endif()
 
 if(ENGINE_BENCH)
   # Per-operation golden tensors, so each CUDA kernel can be verified on its own

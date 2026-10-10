@@ -2,23 +2,53 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <iostream>
 
 namespace engine {
+
+namespace {
+
+// Selecting a backend that was not compiled in must be an error, never a quiet
+// fallback. A benchmark run labelled cuda that silently used the CPU backend
+// would corrupt every number it produced, and nothing downstream could tell.
+std::unique_ptr<Model> build_model(const std::string& backend, const std::string& model_dir,
+                                   const KVCacheManager& kv) {
+  if (backend == "cpu") return make_cpu_model(model_dir, kv);
+  if (backend == "cuda") {
+#ifdef ENGINE_CUDA
+    return make_cuda_model(model_dir, kv);
+#else
+    throw std::runtime_error(
+        "--backend cuda requested but this binary has no CUDA backend. "
+        "Rebuild with -DENGINE_CUDA=ON (see docs/gpu-setup.md), or use --backend cpu. "
+        "Refusing to fall back silently, because results labelled cuda that ran on the CPU "
+        "would be indistinguishable from real ones.");
+#endif
+  }
+  throw std::runtime_error("unknown --backend '" + backend + "'; expected cpu or cuda");
+}
+
+}  // namespace
 
 Engine::Engine(EngineConfig cfg)
     : cfg_(std::move(cfg)),
       tokenizer_(std::make_unique<Tokenizer>(cfg_.model_dir)),
       kv_(cfg_.num_blocks, cfg_.block_size, cfg_.prefix_caching),
-      model_(
-#ifdef ENGINE_CUDA
-          cfg_.backend == "cuda" ? make_cuda_model(cfg_.model_dir, kv_) :
-#endif
-          make_cpu_model(cfg_.model_dir, kv_)),
+      model_(build_model(cfg_.backend, cfg_.model_dir, kv_)),
       scheduler_(cfg_.sched, kv_),
       sampler_(cfg_.seed) {
   metrics_.kv_blocks_total = cfg_.num_blocks;
   ready_ = true;
+}
+
+// Which backend this binary can actually run, for startup banners and scripts.
+bool Engine::cuda_available() {
+#ifdef ENGINE_CUDA
+  return true;
+#else
+  return false;
+#endif
 }
 
 Engine::~Engine() { stop(); }

@@ -52,6 +52,8 @@ class Engine {
   const EngineConfig& engine_config() const { return cfg_; }
   Metrics& metrics() { return metrics_; }
   bool ready() const { return ready_; }
+  // True when the binary was built with the CUDA backend compiled in.
+  static bool cuda_available();
 
  private:
   void run();

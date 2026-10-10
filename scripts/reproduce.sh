@@ -50,10 +50,26 @@ say "model weights"
 
 say "build"
 CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
-if have_gpu; then CMAKE_ARGS+=(-DENGINE_CUDA=ON); BACKEND=cuda; else BACKEND=cpu; fi
+BACKEND=cpu
+# A GPU is only usable if the CUDA backend is actually implemented. Until it is,
+# say so and measure what exists rather than failing the whole run.
+if have_gpu; then
+  if [ -f src/kernels/attention_decode.cu ]; then
+    CMAKE_ARGS+=(-DENGINE_CUDA=ON)
+    BACKEND=cuda
+  else
+    echo "GPU present but the CUDA backend is not implemented yet; measuring the CPU backend."
+    echo "See docs/gpu-setup.md for what remains."
+  fi
+fi
 cmake -S . -B build -G Ninja "${CMAKE_ARGS[@]}" >/dev/null
 cmake --build build >/dev/null
 echo "backend: $BACKEND"
+# Guard against the trap this script would otherwise hide: a run labelled cuda
+# that silently used the CPU backend.
+if [ "$BACKEND" = cuda ]; then
+  ./build/engine generate --model "$MODEL" --backend cuda --prompt hi --max-tokens 1 >/dev/null
+fi
 
 say "correctness"
 # The numerical comparison needs the PyTorch dumps; generate them if absent.
