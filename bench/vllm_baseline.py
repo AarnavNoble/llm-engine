@@ -104,6 +104,9 @@ def main(a):
             "--num-requests", str(a.num_requests),
             "--output-len", str(a.output_len),
             "--output-dist", a.output_dist,
+            # vLLM rejects a completion request without a model, and the name
+            # must match what it registered at startup.
+            "--model", a.model,
         ]
         for _ in range(a.runs):
             subprocess.run(loadgen, check=True, cwd=ROOT)

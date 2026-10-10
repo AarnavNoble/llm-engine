@@ -64,10 +64,17 @@ def make_prompt_ids(n, tok_ids):
     # Deterministic pseudo-prompt: cycle through a bank of token ids; the engine accepts raw ids.
     return [tok_ids[i % len(tok_ids)] for i in range(n)]
 
-async def one(session, url, ids, out_len, ignore_eos, rec):
+async def one(session, url, ids, out_len, ignore_eos, rec, model=None):
     body = {"prompt_token_ids": ids, "max_tokens": out_len, "temperature": 0, "stream": True, "ignore_eos": ignore_eos}
+    # This engine ignores "model" -- it serves exactly one. vLLM's
+    # OpenAI-compatible API requires it and answers a request without one with
+    # a 400 in plain JSON, so no SSE frames ever arrive. Sent only when asked
+    # for, so the field never has to be kept in step with this server.
+    if model: body["model"] = model
     t0 = time.perf_counter(); first = None; last = t0; n = 0
     async with session.post(url + "/v1/completions", json=body) as r:
+        if r.status != 200:
+            raise RuntimeError(f"{url} returned HTTP {r.status}: {(await r.text())[:400]}")
         async for line in r.content:
             if not line.startswith(b"data:"): continue
             if line.strip() == b"data: [DONE]": break
@@ -75,6 +82,13 @@ async def one(session, url, ids, out_len, ignore_eos, rec):
             if first is None: first = now
             else: rec["itl"].append(now - last)
             last = now; n += 1
+    # A 200 that streams nothing is still a failed request, and must say so
+    # here. Falling through left first as None and raised a TypeError on the
+    # subtraction below -- an error about arithmetic, two hundred lines from
+    # the HTTP response that actually explained it.
+    if first is None:
+        raise RuntimeError(f"{url} streamed no tokens (HTTP 200, {n} frames). "
+                           "Check the server log; for vLLM this is usually a rejected request.")
     # n counts every SSE frame; the last one carries finish_reason, not a token.
     rec["ttft"].append(first - t0); rec["e2e"].append(last - t0); rec["tokens"] += max(n - 1, 0)
     rec["per_request"].append({"out_len": out_len, "ttft": first - t0, "e2e": last - t0})
@@ -91,7 +105,7 @@ async def main(a):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as s:
         # warmup
         warm = {"ttft": [], "itl": [], "e2e": [], "tokens": 0, "per_request": []}
-        await asyncio.gather(*[one(s, a.url, make_prompt_ids(64, tok_bank), 16, True, warm)
+        await asyncio.gather(*[one(s, a.url, make_prompt_ids(64, tok_bank), 16, True, warm, a.model)
                                for _ in range(min(8, a.concurrency))])
         m0 = await (await s.get(a.url + "/metrics")).text()
         t0 = time.perf_counter()
@@ -101,7 +115,7 @@ async def main(a):
             async with sem:
                 ids = make_prompt_ids(lens[i], tok_bank[i % 50:] + tok_bank[:i % 50])
                 if a.shared_prefix: ids = prefix + ids[: max(1, lens[i] - a.shared_prefix)]
-                await one(s, a.url, ids, outs[i], True, rec)
+                await one(s, a.url, ids, outs[i], True, rec, a.model)
         tasks = []
         for i in range(a.num_requests):
             if a.rate: await asyncio.sleep(random.expovariate(a.rate))
@@ -154,6 +168,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--tag", default="")
+    # Required by vLLM's API, ignored by this engine's.
+    ap.add_argument("--model", default="")
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--num-requests", type=int, default=256)
     ap.add_argument("--output-len", type=int, default=128, help="mean output length")
