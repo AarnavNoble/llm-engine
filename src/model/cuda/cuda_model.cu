@@ -5,11 +5,14 @@
 // layout and the same KV cache layout, so slot(pos) is identical arithmetic on
 // both sides and a disagreement can never be blamed on the two backends
 // organising memory differently.
+//
+// Activations stay resident. The only transfers per step are a few small index
+// arrays in and the logits out; everything between the embedding and the head
+// is a kernel reading and writing device memory.
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -27,20 +30,20 @@ namespace {
 // CUDA fails silently and asynchronously: an unchecked error from one kernel
 // surfaces as wrong numbers in a different one. Every API call goes through
 // these from the first line of code.
-#define CUDA_CHECK(x)                                                              \
-  do {                                                                             \
-    cudaError_t e_ = (x);                                                          \
-    if (e_ != cudaSuccess)                                                         \
+#define CUDA_CHECK(x)                                                                \
+  do {                                                                               \
+    cudaError_t e_ = (x);                                                            \
+    if (e_ != cudaSuccess)                                                           \
       throw std::runtime_error(std::string(__FILE__ ":") + std::to_string(__LINE__) + \
-                               " " + cudaGetErrorString(e_));                      \
+                               " " + cudaGetErrorString(e_));                        \
   } while (0)
 
-#define CUBLAS_CHECK(x)                                                            \
-  do {                                                                             \
-    cublasStatus_t s_ = (x);                                                       \
-    if (s_ != CUBLAS_STATUS_SUCCESS)                                               \
+#define CUBLAS_CHECK(x)                                                              \
+  do {                                                                               \
+    cublasStatus_t s_ = (x);                                                         \
+    if (s_ != CUBLAS_STATUS_SUCCESS)                                                 \
       throw std::runtime_error(std::string(__FILE__ ":") + std::to_string(__LINE__) + \
-                               " cuBLAS status " + std::to_string(int(s_)));       \
+                               " cuBLAS status " + std::to_string(int(s_)));         \
   } while (0)
 
 size_t g_allocated = 0;
@@ -64,8 +67,8 @@ T* device_alloc(size_t count) {
   return p;
 }
 
-// Weights ship as bf16 and the device wants fp16. Norm weights stay fp32:
-// they are tiny, and the reference computes the normalisation in fp32.
+// Weights ship as bf16 and the device wants fp16. Norms and biases stay fp32:
+// they are tiny, and the reference uses them in fp32.
 __half* upload_f16(const TensorView& t) {
   const std::vector<uint16_t> h = t.to_f16();
   __half* d = device_alloc<__half>(h.size());
@@ -80,26 +83,37 @@ float* upload_f32(const TensorView& t) {
   return d;
 }
 
-// A weight that lives on the device, with a host copy kept only when it is
-// small enough not to matter and the reference needs it (norms and biases).
-struct Weight {
-  __half* dev = nullptr;
-  Tensor host;                      // empty unless a host copy was requested
-  bool present() const { return dev != nullptr; }
-};
-
 struct CudaLayer {
-  Tensor in_norm, post_norm;        // fp32 on the host; the reference normalises in fp32
-  Tensor bq, bk, bv;                // host copies, tiny and added after the GEMM
-  float* in_norm_dev = nullptr;
-  float* post_norm_dev = nullptr;
+  float* in_norm = nullptr;
+  float* post_norm = nullptr;
   __half* wq = nullptr;
   __half* wk = nullptr;
   __half* wv = nullptr;
   __half* wo = nullptr;
+  float* bq = nullptr;     // null on models without qkv bias, such as Llama
+  float* bk = nullptr;
+  float* bv = nullptr;
   __half* wgate = nullptr;
   __half* wup = nullptr;
   __half* wdown = nullptr;
+};
+
+// A device buffer that grows on demand and is then reused. Allocating inside
+// forward() every step is the classic way to make a GPU program mysteriously
+// slow, so every scratch tensor goes through one of these.
+template <typename T>
+struct Scratch {
+  T* ptr = nullptr;
+  size_t cap = 0;
+
+  T* get(size_t need) {
+    if (cap < need) {
+      if (ptr) CUDA_CHECK(cudaFree(ptr));
+      ptr = device_alloc<T>(need);
+      cap = need;
+    }
+    return ptr;
+  }
 };
 
 class CudaModel final : public Model {
@@ -109,15 +123,18 @@ class CudaModel final : public Model {
     CUDA_CHECK(cudaSetDevice(0));
     CUBLAS_CHECK(cublasCreate(&blas_));
     load_weights(dir);
-    rope_.build(cfg_.head_dim, cfg_.max_position_embeddings, cfg_.rope_theta);
-    // Upload the rotation tables once. Recomputing powf per element in the
+
+    // Rotation tables, uploaded once. Recomputing powf per element in the
     // kernel would be slower and would drift from the reference.
-    d_cos_ = device_alloc<float>(rope_.cos.size());
-    d_sin_ = device_alloc<float>(rope_.sin.size());
-    CUDA_CHECK(cudaMemcpy(d_cos_, rope_.cos.data(), rope_.cos.size() * sizeof(float),
+    ref::RopeTables rope;
+    rope.build(cfg_.head_dim, cfg_.max_position_embeddings, cfg_.rope_theta);
+    d_cos_ = device_alloc<float>(rope.cos.size());
+    d_sin_ = device_alloc<float>(rope.sin.size());
+    CUDA_CHECK(cudaMemcpy(d_cos_, rope.cos.data(), rope.cos.size() * sizeof(float),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_sin_, rope_.sin.data(), rope_.sin.size() * sizeof(float),
+    CUDA_CHECK(cudaMemcpy(d_sin_, rope.sin.data(), rope.sin.size() * sizeof(float),
                           cudaMemcpyHostToDevice));
+
     kv_dim_ = cfg_.num_key_value_heads * cfg_.head_dim;
     const size_t slots = static_cast<size_t>(kv.num_total_blocks()) * kv.block_size();
     k_cache_.resize(cfg_.num_hidden_layers);
@@ -138,96 +155,98 @@ class CudaModel final : public Model {
   const ModelConfig& config() const override { return cfg_; }
   const char* backend() const override { return "cuda"; }
 
-  // Step one of the port: the projections run on the device through cuBLAS,
-  // everything else goes through the reference in ops.h via host round-trips.
-  // Slow and pointless as a product, but it proves the plumbing — layout,
-  // strides, weight upload, the transpose convention, residuals, the logits
-  // gather — before any kernel is in question. Each round-trip is then replaced
-  // by one kernel at a time, so nothing is ever debugged alongside something
-  // else new.
   void forward(const StepInput& step, std::vector<float>& logits) override {
     logits.assign(static_cast<size_t>(step.num_logits) * cfg_.vocab_size, 0.f);
     if (step.slices.empty()) return;
 
     const int H = cfg_.hidden_size, hd = cfg_.head_dim, nh = cfg_.num_attention_heads,
-              nkv = cfg_.num_key_value_heads, I = cfg_.intermediate_size,
-              group = cfg_.gqa_group(), bs = kv_.block_size();
+              nkv = cfg_.num_key_value_heads, I = cfg_.intermediate_size, bs = kv_.block_size();
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     flatten(step);
     const int N = static_cast<int>(tok_id_.size());
+    upload_step_indices(N, bs);
 
-    x_.assign(static_cast<size_t>(N) * H, 0.f);
-    embed_tokens(N, x_.data());
+    __half* x = x_.get(static_cast<size_t>(N) * H);
+    __half* h = h_.get(static_cast<size_t>(N) * H);
+    __half* q = q_.get(static_cast<size_t>(N) * H);
+    __half* k = k_.get(static_cast<size_t>(N) * kv_dim_);
+    __half* v = v_.get(static_cast<size_t>(N) * kv_dim_);
+    __half* attn = attn_.get(static_cast<size_t>(N) * H);
+    __half* o = o_.get(static_cast<size_t>(N) * H);
+    __half* gate = gate_.get(static_cast<size_t>(N) * I);
+    __half* up = up_.get(static_cast<size_t>(N) * I);
 
-    h_.resize(static_cast<size_t>(N) * H);
-    q_.resize(static_cast<size_t>(N) * H);
-    k_.resize(static_cast<size_t>(N) * kv_dim_);
-    v_.resize(static_cast<size_t>(N) * kv_dim_);
-    attn_.resize(static_cast<size_t>(N) * H);
-    o_.resize(static_cast<size_t>(N) * H);
-    gate_.resize(static_cast<size_t>(N) * I);
-    up_.resize(static_cast<size_t>(N) * I);
-
-    build_step_indices(N, bs);
+    launch_embedding(embed_, d_token_ids_, x, N, H, nullptr);
 
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
       const CudaLayer& L = layers_[l];
 
-      rmsnorm_device(x_.data(), L.in_norm_dev, h_.data(), N, H);
-      linear(h_.data(), N, H, L.wq, H, L.bq, q_.data());
-      linear(h_.data(), N, H, L.wk, kv_dim_, L.bk, k_.data());
-      linear(h_.data(), N, H, L.wv, kv_dim_, L.bv, v_.data());
+      launch_rmsnorm(x, L.in_norm, h, N, H, cfg_.rms_norm_eps, nullptr);
+      gemm(h, L.wq, q, N, H, H);
+      gemm(h, L.wk, k, N, kv_dim_, H);
+      gemm(h, L.wv, v, N, kv_dim_, H);
+      launch_add_bias(q, L.bq, N, H, nullptr);
+      launch_add_bias(k, L.bk, N, kv_dim_, nullptr);
+      launch_add_bias(v, L.bv, N, kv_dim_, nullptr);
 
-      // Rotate q and k, scatter k and v into the cache, then attend. All three
-      // run on the device against the device-resident cache, so K and V for
-      // tokens that arrived in this same step are visible to each other, which
-      // is what makes a mixed prefill-and-decode step correct.
-      upload_half(d_q_, &d_q_cap_, q_.data(), static_cast<size_t>(N) * H);
-      upload_half(d_k_, &d_k_cap_, k_.data(), static_cast<size_t>(N) * kv_dim_);
-      upload_half(d_v_, &d_v_cap_, v_.data(), static_cast<size_t>(N) * kv_dim_);
+      // K and V for every token in this step are written before any attention
+      // runs, which is what lets tokens that arrived together attend to each
+      // other and makes a mixed prefill-and-decode step correct.
+      launch_rope(q, d_positions_, d_cos_, d_sin_, N, nh, hd, H, nullptr);
+      launch_rope(k, d_positions_, d_cos_, d_sin_, N, nkv, hd, kv_dim_, nullptr);
+      launch_store_kv(k, v, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr);
+      launch_attention_decode(q, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
+                              d_token_seq_, d_positions_, attn, N, nh, nkv, hd, bs, scale,
+                              nullptr);
 
-      launch_rope(d_q_, d_positions_, d_cos_, d_sin_, N, nh, hd, H, nullptr);
-      launch_rope(d_k_, d_positions_, d_cos_, d_sin_, N, nkv, hd, kv_dim_, nullptr);
-      launch_store_kv(d_k_, d_v_, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr);
-      ensure_capacity(&d_attn_, &d_attn_cap_, static_cast<size_t>(N) * H);
-      launch_attention_decode(d_q_, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
-                              d_token_seq_, d_positions_, d_attn_, N, nh, nkv, hd, bs,
-                              scale, nullptr);
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaDeviceSynchronize());
-      download_half(d_attn_, attn_.data(), static_cast<size_t>(N) * H);
+      gemm(attn, L.wo, o, N, H, H);
+      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr);
 
-      linear(attn_.data(), N, H, L.wo, H, Tensor(), o_.data());
-      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
-
-      rmsnorm_device(x_.data(), L.post_norm_dev, h_.data(), N, H);
-      linear(h_.data(), N, H, L.wgate, I, Tensor(), gate_.data());
-      linear(h_.data(), N, H, L.wup, I, Tensor(), up_.data());
-      silu_mul_device(gate_.data(), up_.data(), gate_.size());
-      linear(gate_.data(), N, I, L.wdown, H, Tensor(), o_.data());
-      for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
+      launch_rmsnorm(x, L.post_norm, h, N, H, cfg_.rms_norm_eps, nullptr);
+      gemm(h, L.wgate, gate, N, I, H);
+      gemm(h, L.wup, up, N, I, H);
+      launch_silu_mul(gate, up, static_cast<size_t>(N) * I, nullptr);
+      gemm(gate, L.wdown, o, N, H, I);
+      launch_add_inplace(x, o, static_cast<size_t>(N) * H, nullptr);
     }
 
-    if (logit_rows_.empty()) return;
+    if (logit_rows_.empty()) {
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+      return;
+    }
+
+    // Only the rows that need logits go through the head. They are gathered
+    // device to device, so nothing crosses the bus until the logits themselves.
     const int R = static_cast<int>(logit_rows_.size());
-    // Gather the rows that need logits into one contiguous block first, so the
-    // final norm is a single launch rather than one per row.
-    o_.resize(static_cast<size_t>(R) * H);
     for (int r = 0; r < R; r++)
-      std::copy_n(&x_[static_cast<size_t>(logit_rows_[r]) * H], H, &o_[static_cast<size_t>(r) * H]);
-    h_.resize(static_cast<size_t>(R) * H);
-    rmsnorm_device(o_.data(), final_norm_dev_, h_.data(), R, H);
-    linear(h_.data(), R, H, lm_head_, cfg_.vocab_size, Tensor(), logits.data());
+      CUDA_CHECK(cudaMemcpy(o + static_cast<size_t>(r) * H,
+                            x + static_cast<size_t>(logit_rows_[r]) * H,
+                            static_cast<size_t>(H) * sizeof(__half), cudaMemcpyDeviceToDevice));
+    launch_rmsnorm(o, final_norm_, h, R, H, cfg_.rms_norm_eps, nullptr);
+
+    __half* dlog = logits_.get(static_cast<size_t>(R) * cfg_.vocab_size);
+    gemm(h, lm_head_, dlog, R, cfg_.vocab_size, H);
+
+    // One synchronise per step, here, rather than after every launch. Any error
+    // from any kernel above surfaces at this point.
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const size_t count = static_cast<size_t>(R) * cfg_.vocab_size;
+    stage_.resize(count);
+    CUDA_CHECK(cudaMemcpy(stage_.data(), dlog, count * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) logits[i] = f16_to_f32(stage_[i]);
   }
 
  private:
   // Per-token view of the step, in slice order: the same packing the CPU model
-  // uses, and the layout the kernels will consume.
+  // uses, and the layout the kernels consume.
   void flatten(const StepInput& step) {
-    tok_seq_.clear();
     tok_pos_.clear();
     tok_id_.clear();
+    tok_seq_.clear();
     logit_rows_.clear();
     for (const auto& sl : step.slices) {
       for (int t = 0; t < sl.len; t++) {
@@ -239,119 +258,11 @@ class CudaModel final : public Model {
     }
   }
 
-  // Gather every token's embedding row in one kernel launch, then bring the
-  // result back for the ops that are still running on the host. One bulk copy
-  // instead of a memcpy per token.
-  void embed_tokens(int N, float* out) {
-    const int H = cfg_.hidden_size;
-    const size_t count = static_cast<size_t>(N) * H;
-
-    if (d_token_ids_cap_ < static_cast<size_t>(N)) {
-      if (d_token_ids_) CUDA_CHECK(cudaFree(d_token_ids_));
-      d_token_ids_ = device_alloc<int32_t>(static_cast<size_t>(N));
-      d_token_ids_cap_ = static_cast<size_t>(N);
-    }
-    ensure_capacity(&d_x_, &d_x_cap_, count);
-
-    CUDA_CHECK(cudaMemcpy(d_token_ids_, tok_id_.data(),
-                          static_cast<size_t>(N) * sizeof(int32_t), cudaMemcpyHostToDevice));
-    launch_embedding(embed_, d_token_ids_, d_x_, N, H, nullptr);
-    CUDA_CHECK(cudaGetLastError());        // catches a bad launch configuration
-    CUDA_CHECK(cudaDeviceSynchronize());   // attribute any fault to this kernel
-
-    stage_c_.resize(count);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), d_x_, count * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
-  }
-
-  // Run an op on the device while its neighbours are still host-side: upload,
-  // launch, download. The transfers are pure overhead and all disappear in one
-  // go once every op in the layer is a kernel; until then they keep each new
-  // kernel verifiable on its own.
-  void rmsnorm_device(const float* in, const float* w_dev, float* out, int rows, int cols) {
-    const size_t count = static_cast<size_t>(rows) * cols;
-    ensure_capacity(&dA_, &dA_cap_, count);
-    ensure_capacity(&dC_, &dC_cap_, count);
-
-    stage_a_.resize(count);
-    for (size_t i = 0; i < count; i++) stage_a_[i] = f32_to_f16(in[i]);
-    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
-
-    launch_rmsnorm(dA_, w_dev, dC_, rows, cols, cfg_.rms_norm_eps, nullptr);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    stage_c_.resize(count);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dC_, count * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
-  }
-
-  // Two inputs and one in-place output, so this one needs a second device
-  // buffer alongside the shared scratch.
-  void silu_mul_device(float* gate, const float* up, size_t n) {
-    ensure_capacity(&dA_, &dA_cap_, n);
-    ensure_capacity(&dC_, &dC_cap_, n);
-
-    stage_a_.resize(n);
-    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(gate[i]);
-    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(up[i]);
-    CUDA_CHECK(cudaMemcpy(dC_, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-
-    launch_silu_mul(dA_, dC_, n, nullptr);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    stage_c_.resize(n);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dA_, n * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < n; i++) gate[i] = f16_to_f32(stage_c_[i]);
-  }
-
-  // Rotate q and k in place on the device. Positions are uploaded per step
-  // because they come from each sequence, not from the index in the batch.
-  void rope_device(float* x, int n_tokens, int heads, int row_stride) {
-    const size_t count = static_cast<size_t>(n_tokens) * row_stride;
-    ensure_capacity(&dA_, &dA_cap_, count);
-
-    stage_a_.resize(count);
-    for (size_t i = 0; i < count; i++) stage_a_[i] = f32_to_f16(x[i]);
-    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
-
-    launch_rope(dA_, d_positions_, d_cos_, d_sin_, n_tokens, heads, cfg_.head_dim,
-                row_stride, nullptr);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    stage_c_.resize(count);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dA_, count * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < count; i++) x[i] = f16_to_f32(stage_c_[i]);
-  }
-
-  template <typename T>
-  void ensure_int_capacity(T** buf, size_t* cap, size_t need) {
-    if (*cap >= need) return;
-    if (*buf) CUDA_CHECK(cudaFree(*buf));
-    *buf = device_alloc<T>(need);
-    *cap = need;
-  }
-
-  void upload_half(__half*& buf, size_t* cap, const float* src, size_t n) {
-    ensure_capacity(&buf, cap, n);
-    stage_a_.resize(n);
-    for (size_t i = 0; i < n; i++) stage_a_[i] = f32_to_f16(src[i]);
-    CUDA_CHECK(cudaMemcpy(buf, stage_a_.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-  }
-
-  void download_half(const __half* buf, float* dst, size_t n) {
-    stage_c_.resize(n);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), buf, n * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < n; i++) dst[i] = f16_to_f32(stage_c_[i]);
-  }
-
-  // Everything the kernels need to know about where this step's tokens live:
-  // the slot each one writes to, which sequence it belongs to, and the block
-  // table of each distinct sequence. Built once per step rather than per layer.
-  void build_step_indices(int N, int bs) {
+  // Everything the kernels need about where this step's tokens live: the slot
+  // each one writes to, which sequence it belongs to, and the block table of
+  // each distinct sequence. Block tables are concatenated once per step rather
+  // than per token, because many tokens share a sequence.
+  void upload_step_indices(int N, int bs) {
     h_slots_.resize(N);
     h_token_seq_.resize(N);
     h_tables_.clear();
@@ -373,62 +284,28 @@ class CudaModel final : public Model {
       h_slots_[i] = static_cast<int>(s->block_table.slot(tok_pos_[i], bs));
     }
 
-    ensure_int_capacity(&d_slots_, &d_slots_cap_, h_slots_.size());
-    ensure_int_capacity(&d_token_seq_, &d_token_seq_cap_, h_token_seq_.size());
-    ensure_int_capacity(&d_tables_, &d_tables_cap_, h_tables_.size());
-    ensure_int_capacity(&d_table_offset_, &d_table_offset_cap_, h_table_offset_.size());
-    ensure_int_capacity(&d_positions_, &d_positions_cap_, static_cast<size_t>(N));
+    auto send = [](Scratch<int>& dst, const std::vector<int>& src) {
+      int* d = dst.get(src.empty() ? 1 : src.size());
+      if (!src.empty())
+        CUDA_CHECK(cudaMemcpy(d, src.data(), src.size() * sizeof(int), cudaMemcpyHostToDevice));
+      return d;
+    };
+    d_slots_ = send(slots_buf_, h_slots_);
+    d_token_seq_ = send(token_seq_buf_, h_token_seq_);
+    d_tables_ = send(tables_buf_, h_tables_);
+    d_table_offset_ = send(table_offset_buf_, h_table_offset_);
+    d_positions_ = send(positions_buf_, tok_pos_);
 
-    CUDA_CHECK(cudaMemcpy(d_slots_, h_slots_.data(), h_slots_.size() * sizeof(int),
+    int32_t* ids = token_ids_buf_.get(static_cast<size_t>(N));
+    CUDA_CHECK(cudaMemcpy(ids, tok_id_.data(), static_cast<size_t>(N) * sizeof(int32_t),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_token_seq_, h_token_seq_.data(),
-                          h_token_seq_.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tables_, h_tables_.data(), h_tables_.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_table_offset_, h_table_offset_.data(),
-                          h_table_offset_.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_positions_, tok_pos_.data(), static_cast<size_t>(N) * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  }
-
-  void ensure_capacity(__half** buf, size_t* cap, size_t need) {
-    if (*cap >= need) return;
-    if (*buf) CUDA_CHECK(cudaFree(*buf));
-    *buf = device_alloc<__half>(need);
-    *cap = need;
-  }
-
-  // out[m,n] = in[m,k] * W[n,k]^T + bias, with the GEMM on the device and the
-  // activations converted at the boundary. The conversions are the cost of an
-  // intermediate step; they disappear as the surrounding ops become kernels.
-  void linear(const float* in, int m, int k, const __half* W, int n, const Tensor& bias,
-              float* out) {
-    const size_t a_count = static_cast<size_t>(m) * k;
-    const size_t c_count = static_cast<size_t>(m) * n;
-    ensure_capacity(&dA_, &dA_cap_, a_count);
-    ensure_capacity(&dC_, &dC_cap_, c_count);
-
-    stage_a_.resize(a_count);
-    for (size_t i = 0; i < a_count; i++) stage_a_[i] = f32_to_f16(in[i]);
-    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), a_count * sizeof(__half), cudaMemcpyHostToDevice));
-
-    gemm(dA_, W, dC_, m, n, k);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    stage_c_.resize(c_count);
-    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dC_, c_count * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < c_count; i++) out[i] = f16_to_f32(stage_c_[i]);
-
-    if (bias.numel() == static_cast<size_t>(n))
-      for (int r = 0; r < m; r++)
-        for (int c = 0; c < n; c++) out[static_cast<size_t>(r) * n + c] += bias.ptr()[c];
+    d_token_ids_ = ids;
   }
 
   void load_weights(const std::string& dir) {
     SafeTensorsDir w(dir);
     embed_ = upload_f16(w.get("model.embed_tokens.weight"));
-    final_norm_dev_ = upload_f32(w.get("model.norm.weight"));
-    final_norm_ = w.get("model.norm.weight").to_f32();
+    final_norm_ = upload_f32(w.get("model.norm.weight"));
     // A tied head is the embedding table read a second time, not a copy of it.
     lm_head_ = cfg_.tie_word_embeddings ? embed_ : upload_f16(w.get("lm_head.weight"));
 
@@ -436,18 +313,16 @@ class CudaModel final : public Model {
     for (int l = 0; l < cfg_.num_hidden_layers; l++) {
       const std::string p = "model.layers." + std::to_string(l) + ".";
       CudaLayer& L = layers_[l];
-      L.in_norm_dev = upload_f32(w.get(p + "input_layernorm.weight"));
-      L.post_norm_dev = upload_f32(w.get(p + "post_attention_layernorm.weight"));
-      L.in_norm = w.get(p + "input_layernorm.weight").to_f32();
-      L.post_norm = w.get(p + "post_attention_layernorm.weight").to_f32();
+      L.in_norm = upload_f32(w.get(p + "input_layernorm.weight"));
+      L.post_norm = upload_f32(w.get(p + "post_attention_layernorm.weight"));
       L.wq = upload_f16(w.get(p + "self_attn.q_proj.weight"));
       L.wk = upload_f16(w.get(p + "self_attn.k_proj.weight"));
       L.wv = upload_f16(w.get(p + "self_attn.v_proj.weight"));
       L.wo = upload_f16(w.get(p + "self_attn.o_proj.weight"));
       if (w.has(p + "self_attn.q_proj.bias")) {
-        L.bq = w.get(p + "self_attn.q_proj.bias").to_f32();
-        L.bk = w.get(p + "self_attn.k_proj.bias").to_f32();
-        L.bv = w.get(p + "self_attn.v_proj.bias").to_f32();
+        L.bq = upload_f32(w.get(p + "self_attn.q_proj.bias"));
+        L.bk = upload_f32(w.get(p + "self_attn.k_proj.bias"));
+        L.bv = upload_f32(w.get(p + "self_attn.v_proj.bias"));
       }
       L.wgate = upload_f16(w.get(p + "mlp.gate_proj.weight"));
       L.wup = upload_f16(w.get(p + "mlp.up_proj.weight"));
@@ -458,7 +333,7 @@ class CudaModel final : public Model {
   void report_memory() const {
     size_t free_b = 0, total_b = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-    std::printf("cuda: %s, weights %zu MiB, device %zu MiB free of %zu MiB\n",
+    std::printf("cuda: %s, weights and cache %zu MiB, device %zu MiB free of %zu MiB\n",
                 cfg_.model_type.c_str(), g_allocated >> 20, free_b >> 20, total_b >> 20);
     std::fflush(stdout);
   }
@@ -482,57 +357,29 @@ class CudaModel final : public Model {
 
   __half* embed_ = nullptr;
   __half* lm_head_ = nullptr;
-  float* final_norm_dev_ = nullptr;
-  Tensor final_norm_;
-  std::vector<CudaLayer> layers_;
-
-  // Device scratch for the GEMMs, grown on demand and then reused. Allocating
-  // inside forward() every step is the classic way to make a GPU program
-  // mysteriously slow.
-  __half* dA_ = nullptr;
-  __half* dC_ = nullptr;
-  size_t dA_cap_ = 0, dC_cap_ = 0;
-  std::vector<uint16_t> stage_a_, stage_c_;
-
-  // Per-step token ids on the device, and the embedding output. Grown on
-  // demand like the GEMM scratch.
-  int32_t* d_token_ids_ = nullptr;
-  size_t d_token_ids_cap_ = 0;
-  int* d_positions_ = nullptr;
-  size_t d_positions_cap_ = 0;
+  float* final_norm_ = nullptr;
   float* d_cos_ = nullptr;
   float* d_sin_ = nullptr;
-  __half* d_x_ = nullptr;
-  size_t d_x_cap_ = 0;
+  std::vector<CudaLayer> layers_;
 
-  // The KV cache lives on the device, laid out exactly as the CPU backend has
-  // it: [slot][kv_head][head_dim], with
+  // The KV cache, laid out exactly as the CPU backend has it:
+  // [slot][kv_head][head_dim], with
   // slot = block_table[pos / block_size] * block_size + pos % block_size.
-  // Identical layout means that formula is the same arithmetic on both sides,
-  // so a disagreement can never be the two backends organising memory
-  // differently.
   int kv_dim_ = 0;
   std::vector<__half*> k_cache_, v_cache_;
 
-  // Per-step index arrays for the kernels. The block tables of every sequence
-  // in the step are concatenated once, rather than per token, because many
-  // tokens share a sequence.
-  std::vector<int> h_slots_, h_token_seq_, h_tables_, h_table_offset_;
-  int* d_slots_ = nullptr;
-  int* d_token_seq_ = nullptr;
-  int* d_tables_ = nullptr;
-  int* d_table_offset_ = nullptr;
-  size_t d_slots_cap_ = 0, d_token_seq_cap_ = 0, d_tables_cap_ = 0, d_table_offset_cap_ = 0;
-  __half *d_q_ = nullptr, *d_k_ = nullptr, *d_v_ = nullptr, *d_attn_ = nullptr;
-  size_t d_q_cap_ = 0, d_k_cap_ = 0, d_v_cap_ = 0, d_attn_cap_ = 0;
+  Scratch<__half> x_, h_, q_, k_, v_, attn_, o_, gate_, up_, logits_;
+  Scratch<int> slots_buf_, token_seq_buf_, tables_buf_, table_offset_buf_, positions_buf_;
+  Scratch<int32_t> token_ids_buf_;
+  int *d_slots_ = nullptr, *d_token_seq_ = nullptr, *d_tables_ = nullptr;
+  int *d_table_offset_ = nullptr, *d_positions_ = nullptr;
+  int32_t* d_token_ids_ = nullptr;
 
-  // Per-token view of the step, identical to the CPU packing.
   std::vector<const Sequence*> tok_seq_;
-  std::vector<int> tok_pos_;
+  std::vector<int> tok_pos_, logit_rows_;
   std::vector<int32_t> tok_id_;
-  std::vector<int> logit_rows_;
-  std::vector<float> x_, h_, q_, k_, v_, attn_, o_, gate_, up_, scratch_;
-  ref::RopeTables rope_;
+  std::vector<int> h_slots_, h_token_seq_, h_tables_, h_table_offset_;
+  std::vector<uint16_t> stage_;
 };
 
 }  // namespace

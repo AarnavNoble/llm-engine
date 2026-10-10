@@ -33,6 +33,12 @@ void launch_rope(__half* x, const int* positions, const float* cos_table,
                  const float* sin_table, int n_tokens, int heads, int head_dim,
                  int row_stride, cudaStream_t stream);
 
+// x[i] += y[i], the residual connection.
+void launch_add_inplace(__half* x, const __half* y, size_t n, cudaStream_t stream);
+
+// x[r][c] += bias[c], with the bias kept in fp32 as the reference has it.
+void launch_add_bias(__half* x, const float* bias, int rows, int cols, cudaStream_t stream);
+
 // Scatter k and v rows into their precomputed cache slots.
 void launch_store_kv(const __half* k, const __half* v, const int* slots,
                      __half* k_cache, __half* v_cache, int n_tokens, int kv_dim,
