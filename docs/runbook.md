@@ -31,6 +31,10 @@ cuBLAS needs the transpose trick.
 
 ## Session 1 — bring-up and the easy kernels (~4 hours)
 
+> Follow [session1.md](session1.md) for this one; it is the same plan with every
+> command written out, including the cuBLAS wrapper test and the stub files that
+> keep the tree building from the first minute.
+
 Rent the cheap GPU. Any NVIDIA card; this session does not care how fast it is.
 Pick a CUDA **devel** image so `nvcc` is present.
 
