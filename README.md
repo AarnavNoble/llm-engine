@@ -2,13 +2,15 @@
 
 A serving engine for Llama-architecture models (Qwen2.5-0.5B, TinyLlama) with the parts production engines are built from: a **paged KV cache** with block tables, **continuous batching** with chunked prefill and preemption, **prefix caching** with refcounted block sharing, an **OpenAI-compatible streaming API**, Prometheus metrics, and a Kubernetes deploy that scales on queue depth. No PyTorch at runtime: weights are read from safetensors, the tokenizer parses `tokenizer.json` directly, and the forward pass is C++.
 
-**Status.** The CPU backend is complete and verified layer by layer against PyTorch on two architectures; it serves real requests over the API. **The CUDA backend is not written yet** — `-DENGINE_CUDA=ON` tells you so rather than pretending. The remaining work has a command-by-command [runbook](docs/runbook.md) and a per-kernel [design plan](docs/kernel-plan.md). That means the serving mechanisms (paging, batching, prefix sharing, admission control) are built and measured, while GPU throughput and per-kernel bandwidth are not. Rows awaiting it are marked *not measured* on the results page instead of estimated. What remains, and the plan for it, is in [docs/gpu-setup.md](docs/gpu-setup.md).
+**Status.** The CPU backend is complete and verified layer by layer against PyTorch on two architectures; it serves real requests over the API. The CUDA backend runs: the forward pass is device-resident, with hand-written kernels for embedding, RMSNorm, RoPE, the K/V cache write, silu·up, the residual and bias adds, and paged decode attention, plus cuBLAS for the GEMMs. It is gated against the CPU oracle by `tests/test_cuda_model.cpp`, including a case that deliberately fragments the block table so a kernel computing slots arithmetically cannot pass.
+
+Two pieces are deliberately not written: a dedicated prefill kernel (prefill tokens go through the decode kernel, which is correct but leaves parallelism on the table) and sampling (logits are still read back to the host). What remains, and the plan for it, is in [docs/gpu-setup.md](docs/gpu-setup.md), with a per-kernel design plan in [docs/kernel-plan.md](docs/kernel-plan.md).
 
 Every optimization is a commit with a measured before/after number, and CI fails if any figure quoted in the docs disagrees with the data the harness produced.
 
 ## Benchmark
 
-Full tables, the protocol, and what each figure does and does not mean: **[docs/results.md](docs/results.md)**, generated from `bench/results/*.json` by `bench/report.py`, so the published numbers cannot drift from what the harness measured. Rows awaiting the CUDA backend are rendered as *not measured* rather than estimated.
+Full tables, the protocol, and what each figure does and does not mean: **[docs/results.md](docs/results.md)**, generated from `bench/results/*.json` by `bench/report.py`, so the published numbers cannot drift from what the harness measured. The page records the hardware each figure came from, and any row without data behind it is rendered as *not measured* rather than estimated.
 
 Reproduce everything on one machine with `scripts/reproduce.sh` (add `--quick` for a smoke check, which writes to a separate directory and leaves the published numbers alone).
 
@@ -39,8 +41,10 @@ client ──HTTP/SSE──▶ api/         /v1/completions  /v1/chat/completion
                       ▼
                     model/        Llama forward pass over paged K/V: cpu/ (fp32 oracle) and cuda/
                       │
-                    kernels/      rmsnorm · rope+cache-write · paged decode attention · prefill attention
-                                  silu·up · embedding · sampling            (cuBLAS for the GEMMs)
+                    kernels/      rmsnorm · rope · cache write · paged decode attention
+                                  silu·up · embedding · bias and residual adds
+                                  (cuBLAS for the GEMMs; prefill shares the decode
+                                   kernel, and sampling is still done on the host)
 ```
 
 ## Quickstart

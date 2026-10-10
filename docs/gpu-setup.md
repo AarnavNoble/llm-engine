@@ -7,25 +7,37 @@ design of each kernel, including the reference it must match and the mistakes
 that actually happen, is in [kernel-plan.md](kernel-plan.md). This page is the
 machine setup.
 
-The CPU backend is complete. The CUDA backend is not written: `src/kernels/`
-and `src/model/cuda/` are empty, and configuring with `ENGINE_CUDA=ON` fails
-with a message saying so. The work, in dependency order:
+The CPU backend is complete, and the CUDA backend runs end to end against the
+CPU oracle. Done:
+
+| # | Item | How it was checked |
+|---|---|---|
+| 1 | `cuda_model.cu`: weight upload, cuBLAS GEMMs, rmsnorm / RoPE / silu·up / embedding / cache-write kernels | GPU logits match the CPU oracle and the PyTorch dumps |
+| 2 | **`attention_decode.cu`**: paged, online softmax, GQA-aware | matches the oracle, including a deliberately fragmented block table |
+| 3 | Device-resident forward pass, no host round-trip per op | one synchronise per step; greedy output identical to the CPU backend |
+
+Remaining, in dependency order:
 
 | # | Item | Exit criterion |
 |---|---|---|
-| 1 | `cuda_model.cu`: weight upload, cuBLAS GEMMs, naive rmsnorm / RoPE / silu·up / embedding kernels, naive contiguous attention | GPU logits match the CPU oracle layer by layer |
-| 2 | `sampling.cu` | greedy and top-p on device, logits never reach the host |
-| 3 | **`attention_decode.cu`**: paged, online softmax, GQA-aware | the three invariances still hold; matches the oracle |
-| 4 | `attention_prefill.cu` (or cuBLAS + masked softmax) | same |
-| 5 | Benchmark rows via `scripts/reproduce.sh` | 8 rows stop saying "not measured" |
-| 6 | vLLM row | `bench/vllm_baseline.py`, already written |
-| 7 | Fusions (RoPE + cache write, silu·up), vectorised loads, split-K, `ncu` table | bandwidth against the 1,008 GB/s peak |
-| 8 | CUDA graphs for decode at fixed batch sizes | `nsys` before and after |
-| 9 | k3s + KEDA on this node, Grafana screenshot | scaler reacts to queue depth |
+| 4 | `sampling.cu` | greedy and top-p on device, logits never reach the host |
+| 5 | `attention_prefill.cu` (or cuBLAS + masked softmax) | matches the oracle; prefill currently works through the decode kernel |
+| 6 | Benchmark rows via `scripts/reproduce.sh` | the GPU rows stop saying "not measured" |
+| 7 | vLLM row | `bench/vllm_baseline.py`, already written |
+| 8 | Fuse RoPE with the cache write, vectorised loads, split-K, `ncu` table | bandwidth against the card's peak |
+| 9 | CUDA graphs for decode at fixed batch sizes | `nsys` before and after |
+| 10 | k3s + KEDA on this node, Grafana screenshot | scaler reacts to queue depth |
 
-Items 1, 3, 5 are the ones that make the project what it claims to be. Items
-7 and 8 are optimisation; 9 is packaging. The cut order if time runs short is
-9, then 8, then 7, then 4 via cuBLAS.
+Item 6 is what makes the project what it claims to be: the mechanisms are
+built and verified, and until they are measured on a GPU the throughput claims
+are unsupported. Items 8 and 9 are optimisation; 10 is packaging. The cut
+order if time runs short is 10, then 9, then 8, then 5 via cuBLAS.
+
+The silu·up fusion is already done — `src/kernels/silu_mul.cu` computes
+`silu(gate) * up` in one pass, which is the point of that kernel existing
+rather than two. Only the RoPE/cache-write fusion is outstanding, and
+`store_kv.cu` is deliberately separate from `rope.cu` so the fusion can be
+measured as a before/after rather than assumed.
 
 # GPU box setup (RunPod RTX 4090)
 
