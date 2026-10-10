@@ -26,7 +26,14 @@ RESULTS = pathlib.Path(os.environ["ENGINE_RESULTS_DIR"]) if os.environ.get("ENGI
     else ROOT / "bench/results"
 
 
+# Every tag any table asks for, whether or not a file existed. An orphaned
+# results file means the harness measured something under a name nothing
+# renders, which otherwise shows up only as a silently empty row.
+REQUESTED = set()
+
+
 def load(name):
+    REQUESTED.add(name)
     p = RESULTS / f"{name}.json"
     if not p.exists():
         return None
@@ -254,9 +261,25 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.md").write_text(md)
     (out_dir / "results.html").write_text(html(md))
-    measured = sum(1 for r in serving_rows() if r[2] is not None)
+    rows = serving_rows()
+    measured = sum(1 for r in rows if r[2] is not None)
     print(f"wrote {out_dir}/results.md and {out_dir}/results.html "
-          f"({measured} of {len(serving_rows())} serving rows measured)")
+          f"({measured} of {len(rows)} serving rows measured)")
+
+    # A results file under a tag no table reads is a harness bug, not an
+    # unmeasured row: the work was done and the number thrown away. This was a
+    # real failure -- reproduce.sh tagged its GPU runs "cuda-static" from the
+    # backend name while this file asked for "gpu-static", so a full run
+    # published a headline table with every row empty and said so only in the
+    # count above. Reported loudly, and non-zero exit so a harness can catch it.
+    present = {p.stem for p in RESULTS.glob("*.json")}
+    orphans = sorted(present - REQUESTED)
+    if orphans:
+        print(f"\nERROR: {len(orphans)} results file(s) under tags no table renders:")
+        for o in orphans:
+            print(f"  {RESULTS / (o + '.json')}")
+        print("Either the benchmark is writing the wrong tag or a table is missing.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -125,8 +125,12 @@ bench_mode() {  # bench_mode <mode> <tag>
 }
 
 say "static vs continuous batching ($BACKEND backend)"
-bench_mode static "$BACKEND-static"
-bench_mode continuous "$BACKEND-continuous"
+# The tag is the name the report renders under, which is not the backend's own
+# name: the CUDA backend's rows are published as gpu-*. Deriving the tag from
+# $BACKEND wrote cuda-static, which no table reads.
+TAG=$([ "$BACKEND" = cuda ] && echo gpu || echo cpu)
+bench_mode static "$TAG-static"
+bench_mode continuous "$TAG-continuous"
 
 say "prefix caching"
 scripts/bench_prefix.sh 512 "$REQUESTS" "$CONC"
