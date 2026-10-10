@@ -51,9 +51,17 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(engine_core PUBLIC -O3)
 endif()
 
-# The CUDA backend. Its sources are listed here before they exist so the build
-# shape is settled, but configuring with ENGINE_CUDA=ON while they are missing
-# would fail with a confusing missing-file error, so say what is actually wrong.
+# The CUDA backend.
+#
+# This list once doubled as an implementation check: configuring with
+# ENGINE_CUDA=ON while a source was absent produced a message explaining that
+# the backend was unwritten, rather than a confusing missing-file error. The
+# check has been removed because it never measured what it claimed to. Both
+# attention_prefill.cu and sampling.cu existed for months as one-line comments,
+# which satisfies an existence test and compiles to an empty translation unit;
+# the guard reported a complete backend while two of its kernels were absent.
+# Whether a backend works is a question for the test suite, which compares
+# against the CPU oracle, not for a file listing.
 set(ENGINE_CUDA_SOURCES
   src/model/cuda/cuda_model.cu
   src/kernels/rmsnorm.cu
@@ -66,21 +74,6 @@ set(ENGINE_CUDA_SOURCES
   src/kernels/attention_prefill.cu
   src/kernels/sampling.cu
 )
-set(ENGINE_CUDA_MISSING "")
-foreach(src ${ENGINE_CUDA_SOURCES})
-  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/${src})
-    list(APPEND ENGINE_CUDA_MISSING ${src})
-  endif()
-endforeach()
-
-if(ENGINE_CUDA AND ENGINE_CUDA_MISSING)
-  message(FATAL_ERROR
-    "ENGINE_CUDA=ON but the CUDA backend is not implemented yet.\n"
-    "Missing: ${ENGINE_CUDA_MISSING}\n"
-    "The CPU backend is complete and is the default: drop -DENGINE_CUDA=ON.\n"
-    "Status and the plan for the GPU work are in docs/gpu-setup.md.")
-endif()
-
 if(ENGINE_CUDA)
   # The architecture has to be chosen *before* enable_language(CUDA): that call
   # compiles a probe binary, and with no architecture set it tries to detect one
