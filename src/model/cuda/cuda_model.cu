@@ -110,6 +110,14 @@ class CudaModel final : public Model {
     CUBLAS_CHECK(cublasCreate(&blas_));
     load_weights(dir);
     rope_.build(cfg_.head_dim, cfg_.max_position_embeddings, cfg_.rope_theta);
+    // Upload the rotation tables once. Recomputing powf per element in the
+    // kernel would be slower and would drift from the reference.
+    d_cos_ = device_alloc<float>(rope_.cos.size());
+    d_sin_ = device_alloc<float>(rope_.sin.size());
+    CUDA_CHECK(cudaMemcpy(d_cos_, rope_.cos.data(), rope_.cos.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sin_, rope_.sin.data(), rope_.sin.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
     kv_dim_ = cfg_.num_key_value_heads * cfg_.head_dim;
     const size_t slots = static_cast<size_t>(kv.num_total_blocks()) * kv.block_size();
     k_cache_.assign(cfg_.num_hidden_layers, std::vector<float>(slots * kv_dim_, 0.f));
@@ -165,12 +173,13 @@ class CudaModel final : public Model {
       linear(h_.data(), N, H, L.wk, kv_dim_, L.bk, k_.data());
       linear(h_.data(), N, H, L.wv, kv_dim_, L.bv, v_.data());
 
-      // Rotate and write K/V for every token first, so tokens that arrived in
-      // this same step can attend to one another.
+      // Rotate q and k on the device, then write K/V into the cache. The cache
+      // write is still host-side; it fuses into this kernel once the cache
+      // itself lives on the device.
+      rope_device(q_.data(), N, nh, H);
+      rope_device(k_.data(), N, nkv, kv_dim_);
       for (int i = 0; i < N; i++) {
         const int pos = tok_pos_[i];
-        ref::rope_inplace(&q_[static_cast<size_t>(i) * H], nh, hd, pos, rope_);
-        ref::rope_inplace(&k_[static_cast<size_t>(i) * kv_dim_], nkv, hd, pos, rope_);
         const int64_t slot = tok_seq_[i]->block_table.slot(pos, bs);
         std::copy_n(&k_[static_cast<size_t>(i) * kv_dim_], kv_dim_,
                     kc + static_cast<size_t>(slot) * kv_dim_);
@@ -296,6 +305,34 @@ class CudaModel final : public Model {
     for (size_t i = 0; i < n; i++) gate[i] = f16_to_f32(stage_c_[i]);
   }
 
+  // Rotate q and k in place on the device. Positions are uploaded per step
+  // because they come from each sequence, not from the index in the batch.
+  void rope_device(float* x, int n_tokens, int heads, int row_stride) {
+    const size_t count = static_cast<size_t>(n_tokens) * row_stride;
+    ensure_capacity(&dA_, &dA_cap_, count);
+
+    if (d_positions_cap_ < static_cast<size_t>(n_tokens)) {
+      if (d_positions_) CUDA_CHECK(cudaFree(d_positions_));
+      d_positions_ = device_alloc<int>(static_cast<size_t>(n_tokens));
+      d_positions_cap_ = static_cast<size_t>(n_tokens);
+    }
+    CUDA_CHECK(cudaMemcpy(d_positions_, tok_pos_.data(),
+                          static_cast<size_t>(n_tokens) * sizeof(int), cudaMemcpyHostToDevice));
+
+    stage_a_.resize(count);
+    for (size_t i = 0; i < count; i++) stage_a_[i] = f32_to_f16(x[i]);
+    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
+
+    launch_rope(dA_, d_positions_, d_cos_, d_sin_, n_tokens, heads, cfg_.head_dim,
+                row_stride, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    stage_c_.resize(count);
+    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dA_, count * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) x[i] = f16_to_f32(stage_c_[i]);
+  }
+
   void ensure_capacity(__half** buf, size_t* cap, size_t need) {
     if (*cap >= need) return;
     if (*buf) CUDA_CHECK(cudaFree(*buf));
@@ -403,6 +440,10 @@ class CudaModel final : public Model {
   // demand like the GEMM scratch.
   int32_t* d_token_ids_ = nullptr;
   size_t d_token_ids_cap_ = 0;
+  int* d_positions_ = nullptr;
+  size_t d_positions_cap_ = 0;
+  float* d_cos_ = nullptr;
+  float* d_sin_ = nullptr;
   __half* d_x_ = nullptr;
   size_t d_x_cap_ = 0;
 

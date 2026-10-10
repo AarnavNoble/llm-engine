@@ -26,6 +26,13 @@ void launch_rmsnorm(const __half* x, const float* weight, __half* out,
 // gate[i] = silu(gate[i]) * up[i], in place over n elements.
 void launch_silu_mul(__half* gate, const __half* up, size_t n, cudaStream_t stream);
 
+// Rotary embedding in place over x[n_tokens][row_stride], rotating `heads`
+// heads of head_dim each. Positions come from the sequence, one per token, so
+// chunked prefill and recompute-after-preemption stay correct.
+void launch_rope(__half* x, const int* positions, const float* cos_table,
+                 const float* sin_table, int n_tokens, int heads, int head_dim,
+                 int row_stride, cudaStream_t stream);
+
 }  // namespace engine
 
 #endif  // ENGINE_CUDA
