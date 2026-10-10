@@ -16,7 +16,7 @@ measurable on the CPU backend.
 
   python3 scripts/bench_chunked_prefill.py --chunks 2048 512 128
 """
-import argparse, json, pathlib, socket, statistics, subprocess, sys, threading, time, urllib.request
+import argparse, json, os, pathlib, socket, statistics, subprocess, sys, threading, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -123,7 +123,7 @@ def main(a):
     for r in rows:
         print(f"| {r['chunk']:>6} | {r['itl_p50_ms']:>7.0f}ms | {r['itl_p95_ms']:>7.0f}ms | "
               f"{r['itl_max_ms']:>8.0f}ms | {r['long_prompt_ttft_s']:>8.2f}s |")
-    out = ROOT / "bench/results/chunked-prefill.json"
+    out = pathlib.Path(os.environ.get("ENGINE_RESULTS_DIR", ROOT / "bench/results")) / "chunked-prefill.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(rows, indent=2))
     print(f"\nwrote {out}")

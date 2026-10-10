@@ -6,22 +6,22 @@ Every optimization is a tagged commit with a measured before/after number.
 
 ## Benchmark
 
-Qwen2.5-0.5B-Instruct, fp16, RTX 4090, 32 concurrent requests, prompt mix 128/512/1024, 128 output tokens, median of 3 runs. Each row is a git tag: `scripts/bench_all.sh <tag>` reproduces it.
+Full tables, the protocol, and what each figure does and does not mean: **[docs/results.md](docs/results.md)**, generated from `bench/results/*.json` by `bench/report.py`, so the published numbers cannot drift from what the harness measured. Rows awaiting the CUDA backend are rendered as *not measured* rather than estimated.
 
-| Config | Tokens/s | TTFT p50 / p95 (ms) | Inter-token p50 / p95 (ms) | KV waste % |
-|---|---|---|---|---|
-| HF transformers, batch=1 | | | | |
-| `v0.1-baseline` static batching, contiguous KV | | | | |
-| `v0.2-paged` static batching, paged KV | | | | |
-| `v0.3-continuous` + continuous batching | | | | |
-| `v0.4-prefix` + prefix caching (shared 512-tok system prompt) | | | | |
-| `v0.5-kernels` + fused rope/cache-write, silu·up, optimized decode attention | | | | |
-| `v0.6-graphs` + CUDA graphs | | | | |
-| vLLM, same model and GPU (reference) | | | | |
+Reproduce everything on one machine with `scripts/reproduce.sh` (add `--quick` for a smoke check, which writes to a separate directory and leaves the published numbers alone).
 
-*Status: the CPU path is complete and verified against PyTorch (`v0.0-cpu`); throughput rows need the CUDA backend.*
+Measured so far, all on a 10-core Mac with the CPU backend except the first row, which is hardware independent:
 
-The KV-waste column is already measured, because memory efficiency is a property of the allocator rather than of the GPU. Against a contiguous allocator on the same workload and memory budget, paged allocation reaches **98.8% slot utilization versus 55.5%**, and continuous batching keeps **41.1 sequences decoding per step versus 14.6** for static batching. Continuous batching is measured too, now that the CPU forward pass packs every slice in a step into one set of GEMMs: **1.47x the throughput** of static batching and **5.9x faster TTFT p50** on 48 requests at 16 concurrent. Prefix caching is measurable because a cache hit removes prefill work rather than rescheduling it: across 32 requests sharing a 512-token system prompt, it cut **TTFT p50 by 2.8x** at a 77.5% block hit ratio, which is the ceiling for that workload. Full table, protocol, and an explanation of which rows cannot honestly be measured on a CPU are in [docs/benchmarks.md](docs/benchmarks.md).
+| Result | Number |
+|---|---|
+| KV slot utilization, paged vs contiguous with a declared cap | **98.8%** vs 55.5% (1.7% reserving full context) |
+| Continuous vs static batching, throughput | **1.47x** |
+| Continuous vs static batching, TTFT p50 | **5.9x faster** (13,673 ms to 2,330 ms) |
+| Prefix caching, TTFT p50 on a shared 512-token prompt | **2.8x faster**, 77.5% block hit ratio (the ceiling for that workload) |
+| Chunked prefill, worst decode stall with a 2,048-token prompt injected | **11.8x smaller** (23.2 s to 2.0 s) |
+| Admission watermark, preemption recompute waste | **16.9% to 3.2%** of all token work, at 0.7% occupancy cost |
+
+GPU throughput, per-kernel Nsight bandwidth, and a vLLM reference row on the same hardware are the remaining rows; `bench/vllm_baseline.py` and the harness are ready for them.
 
 ## Architecture
 

@@ -13,6 +13,14 @@ import aiohttp
 
 MIX = [(128, 0.5), (512, 0.3), (1024, 0.2)]
 
+
+def results_dir():
+    """Where to record runs. ENGINE_RESULTS_DIR keeps a smoke run from
+    overwriting the published numbers in bench/results/."""
+    import os
+    d = os.environ.get("ENGINE_RESULTS_DIR")
+    return pathlib.Path(d) if d else pathlib.Path(__file__).resolve().parent / "results"
+
 # Output lengths must vary. With one fixed length every request finishes on the
 # same step, which hides the entire cost of static batching: nothing is ever
 # waiting behind a longer neighbour.
@@ -104,7 +112,7 @@ async def main(a):
     }
     print(json.dumps(res, indent=2))
     if a.tag:
-        out = pathlib.Path(__file__).parent / "results" / f"{a.tag}.json"
+        out = results_dir() / f"{a.tag}.json"
         out.parent.mkdir(exist_ok=True)
         runs = json.loads(out.read_text()) if out.exists() else []
         runs.append(res); out.write_text(json.dumps(runs, indent=2))

@@ -30,15 +30,18 @@ run() {  # run <tag> <extra server flags...>
   kill -TERM $pid; wait $pid 2>/dev/null || true
 }
 
-rm -f "bench/results/prefix-on.json" "bench/results/prefix-off.json"
+RESULTS_DIR=${ENGINE_RESULTS_DIR:-bench/results}
+mkdir -p "$RESULTS_DIR"
+rm -f "$RESULTS_DIR/prefix-on.json" "$RESULTS_DIR/prefix-off.json"
 echo "=== prefix caching OFF ==="
 run prefix-off --no-prefix-cache
 echo "=== prefix caching ON ==="
 run prefix-on
 
 python3 - <<'PY'
-import json, pathlib
-r = lambda t: json.loads(pathlib.Path(f"bench/results/{t}.json").read_text())[-1]
+import json, os, pathlib
+d = pathlib.Path(os.environ.get("ENGINE_RESULTS_DIR", "bench/results"))
+r = lambda t: json.loads((d / f"{t}.json").read_text())[-1]
 off, on = r("prefix-off"), r("prefix-on")
 print(f"\n{'':28} {'off':>10} {'on':>10} {'change':>10}")
 for k, label, unit in (("ttft_p50_ms", "TTFT p50", "ms"), ("ttft_p95_ms", "TTFT p95", "ms"),

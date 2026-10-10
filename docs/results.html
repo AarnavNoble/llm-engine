@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>engine — benchmark results</title>
+<style>
+:root { --fg:#1a1a1a; --muted:#666; --line:#e2e2e2; --accent:#0b5fff; --bg:#fff; --code:#f6f7f9; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6e6e6; --muted:#9aa0a6; --line:#2d2f33; --accent:#6ea8ff; --bg:#141518; --code:#1d1f23; }
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+  font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+main { max-width:70rem; margin:0 auto; padding:3rem 1.25rem 5rem; }
+h1 { font-size:1.9rem; margin:0 0 .25rem; letter-spacing:-.02em; }
+h2 { font-size:1.2rem; margin:2.75rem 0 .5rem; padding-top:1.25rem; border-top:1px solid var(--line); }
+p { color:var(--fg); max-width:60rem; }
+.sub { color:var(--muted); margin:0 0 2rem; }
+a { color:var(--accent); }
+code { background:var(--code); padding:.1em .35em; border-radius:4px; font-size:.9em; }
+.scroll { overflow-x:auto; margin:1rem 0; }
+table { border-collapse:collapse; width:100%; font-size:.9rem; min-width:40rem; }
+th,td { text-align:left; padding:.5rem .7rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+th { font-weight:600; color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }
+td:not(:first-child),th:not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; }
+tr.pending td { color:var(--muted); font-style:italic; }
+strong { font-weight:600; }
+footer { margin-top:3rem; color:var(--muted); font-size:.85rem; }
+</style></head>
+<body><main>
+<h1>engine</h1>
+<p class="sub">An LLM inference server written from scratch in C++ and CUDA.
+Paged KV cache, continuous batching, prefix caching, OpenAI-compatible streaming API.
+<a href="https://github.com/AarnavNoble/llm-engine">Source on GitHub</a>.</p>
+<p><em>Generated 2026-10-09 from <code>bench/results/</code>.</em></p>
+<h2>Serving throughput and latency</h2>
+<p>Qwen2.5-0.5B-Instruct, 32 concurrent requests, prompt mix 128/512/1024 at 50/30/20, geometric output lengths around 128, median of the recorded runs.</p>
+<div class="scroll"><table>
+<thead><tr><th>Config</th><th>Backend</th><th>Tokens/s</th><th>TTFT p50</th><th>TTFT p95</th><th>ITL p50</th><th>ITL p95</th><th>runs</th></tr></thead><tbody>
+<tr class="pending"><td>HF transformers, batch 1</td><td>reference floor</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>HF transformers, padded batch 32</td><td>naive batching</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr><td>engine, static batching</td><td>CPU backend</td><td>38.9</td><td>13,673 ms</td><td>14,696 ms</td><td>94.9 ms</td><td>117.1 ms</td><td>1</td></tr>
+<tr><td>engine, continuous batching</td><td>CPU backend</td><td>57.1</td><td>2,330 ms</td><td>2,522 ms</td><td>106.7 ms</td><td>122.5 ms</td><td>1</td></tr>
+<tr class="pending"><td>engine, static batching</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>engine, continuous batching</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>engine, + prefix caching</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>engine, + fused kernels</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>engine, + CUDA graphs</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr class="pending"><td>vLLM, same model and GPU</td><td>reference</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+</tbody></table></div>
+<h2>KV cache efficiency</h2>
+<p>Allocator property, measured with a fake model, so it is hardware independent. 256 requests, 65,536 KV token slots (4096 blocks of 16), outputs around 128 tokens.</p>
+<div class="scroll"><table>
+<thead><tr><th>Strategy</th><th>Slot utilization</th><th>KV waste</th><th>Resident seqs</th><th>Decoding seqs</th><th>Preemptions</th></tr></thead><tbody>
+<tr><td>contiguous (reserve max<em>model</em>len)</td><td>1.6%</td><td>98.4%</td><td>2.0</td><td>1.4</td><td>0</td></tr>
+<tr><td>contiguous (reserve prompt + max_tokens)</td><td>48.0%</td><td>52.0%</td><td>54.6</td><td>14.2</td><td>0</td></tr>
+<tr><td>contiguous (reserve prompt + max_tokens)</td><td>54.1%</td><td>45.9%</td><td>42.8</td><td>42.8</td><td>0</td></tr>
+<tr><td>paged, static batching</td><td>98.7%</td><td>1.3%</td><td>63.7</td><td>16.0</td><td>0</td></tr>
+<tr><td>paged, continuous batching</td><td>98.7%</td><td>1.4%</td><td>43.7</td><td>43.3</td><td>0</td></tr>
+</tbody></table></div>
+<h2>Prefix caching</h2>
+<p>32 requests sharing a 512-token system prompt with a 128-token tail each.</p>
+<div class="scroll"><table>
+<thead><tr><th>Metric</th><th>Cache off</th><th>Cache on</th><th>Change</th></tr></thead><tbody>
+<tr><td>TTFT p50</td><td>20,118.2 ms</td><td>7,267.7 ms</td><td><strong>2.8x faster</strong></td></tr>
+<tr><td>TTFT p95</td><td>27,874.2 ms</td><td>8,609.5 ms</td><td><strong>3.2x faster</strong></td></tr>
+<tr><td>end-to-end p50</td><td>24.4 s</td><td>8.5 s</td><td><strong>2.9x faster</strong></td></tr>
+<tr><td>wall clock</td><td>101.7 s</td><td>35.0 s</td><td><strong>2.9x faster</strong></td></tr>
+</tbody></table></div>
+<p>Block hit ratio 77.5%.</p>
+<h2>Chunked prefill</h2>
+<p>Four streams decoding while a 2,048-token prompt is injected mid-flight. The worst gap is what a user watching tokens appear actually feels; p95 over a few hundred samples hides a single long stall.</p>
+<div class="scroll"><table>
+<thead><tr><th>Chunk size</th><th>ITL p50</th><th>ITL p95</th><th>Worst gap</th><th>Injected prompt TTFT</th></tr></thead><tbody>
+<tr><td>2048</td><td>92 ms</td><td>561 ms</td><td><strong>23,203 ms</strong></td><td>23.81 s</td></tr>
+<tr><td>512</td><td>89 ms</td><td>6,813 ms</td><td><strong>9,750 ms</strong></td><td>23.63 s</td></tr>
+<tr><td>128</td><td>91 ms</td><td>1,653 ms</td><td><strong>1,969 ms</strong></td><td>24.69 s</td></tr>
+</tbody></table></div>
+<footer>Every figure is generated from the JSON the benchmark harness wrote, by
+<code>bench/report.py</code>. Rows marked <em>not measured</em> are waiting on the CUDA
+backend rather than estimated. Reproduce with <code>scripts/reproduce.sh</code>.</footer>
+</main></body></html>
