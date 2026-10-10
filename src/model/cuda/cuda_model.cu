@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/cuda_kernels.h"
 #include "engine/model.h"
 #include "engine/ops.h"
 #include "engine/safetensors.h"
@@ -142,7 +143,7 @@ class CudaModel final : public Model {
     const int N = static_cast<int>(tok_id_.size());
 
     x_.assign(static_cast<size_t>(N) * H, 0.f);
-    for (int i = 0; i < N; i++) gather_embedding(tok_id_[i], &x_[static_cast<size_t>(i) * H]);
+    embed_tokens(N, x_.data());
 
     h_.resize(static_cast<size_t>(N) * H);
     q_.resize(static_cast<size_t>(N) * H);
@@ -223,14 +224,29 @@ class CudaModel final : public Model {
     }
   }
 
-  // One embedding row, read straight out of the device table. No kernel needed
-  // for a gather this simple while the rest is still round-tripping.
-  void gather_embedding(int32_t token, float* out) {
+  // Gather every token's embedding row in one kernel launch, then bring the
+  // result back for the ops that are still running on the host. One bulk copy
+  // instead of a memcpy per token.
+  void embed_tokens(int N, float* out) {
     const int H = cfg_.hidden_size;
-    stage_a_.resize(static_cast<size_t>(H));
-    CUDA_CHECK(cudaMemcpy(stage_a_.data(), embed_ + static_cast<size_t>(token) * H,
-                          static_cast<size_t>(H) * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < H; i++) out[i] = f16_to_f32(stage_a_[i]);
+    const size_t count = static_cast<size_t>(N) * H;
+
+    if (d_token_ids_cap_ < static_cast<size_t>(N)) {
+      if (d_token_ids_) CUDA_CHECK(cudaFree(d_token_ids_));
+      d_token_ids_ = device_alloc<int32_t>(static_cast<size_t>(N));
+      d_token_ids_cap_ = static_cast<size_t>(N);
+    }
+    ensure_capacity(&d_x_, &d_x_cap_, count);
+
+    CUDA_CHECK(cudaMemcpy(d_token_ids_, tok_id_.data(),
+                          static_cast<size_t>(N) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    launch_embedding(embed_, d_token_ids_, d_x_, N, H, nullptr);
+    CUDA_CHECK(cudaGetLastError());        // catches a bad launch configuration
+    CUDA_CHECK(cudaDeviceSynchronize());   // attribute any fault to this kernel
+
+    stage_c_.resize(count);
+    CUDA_CHECK(cudaMemcpy(stage_c_.data(), d_x_, count * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
   }
 
   void ensure_capacity(__half** buf, size_t* cap, size_t need) {
@@ -335,6 +351,13 @@ class CudaModel final : public Model {
   __half* dC_ = nullptr;
   size_t dA_cap_ = 0, dC_cap_ = 0;
   std::vector<uint16_t> stage_a_, stage_c_;
+
+  // Per-step token ids on the device, and the embedding output. Grown on
+  // demand like the GEMM scratch.
+  int32_t* d_token_ids_ = nullptr;
+  size_t d_token_ids_cap_ = 0;
+  __half* d_x_ = nullptr;
+  size_t d_x_cap_ = 0;
 
   // The KV cache still lives on the host while attention is the reference
   // implementation. It moves to the device with attention_decode.cu, and the
