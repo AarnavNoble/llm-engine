@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -159,7 +160,7 @@ class CudaModel final : public Model {
       float* kc = k_cache_[l].data();
       float* vc = v_cache_[l].data();
 
-      ref::rmsnorm(x_.data(), L.in_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      rmsnorm_device(x_.data(), L.in_norm_dev, h_.data(), N, H);
       linear(h_.data(), N, H, L.wq, H, L.bq, q_.data());
       linear(h_.data(), N, H, L.wk, kv_dim_, L.bk, k_.data());
       linear(h_.data(), N, H, L.wv, kv_dim_, L.bv, v_.data());
@@ -189,7 +190,7 @@ class CudaModel final : public Model {
       linear(attn_.data(), N, H, L.wo, H, Tensor(), o_.data());
       for (size_t i = 0; i < x_.size(); i++) x_[i] += o_[i];
 
-      ref::rmsnorm(x_.data(), L.post_norm.ptr(), h_.data(), N, H, cfg_.rms_norm_eps);
+      rmsnorm_device(x_.data(), L.post_norm_dev, h_.data(), N, H);
       linear(h_.data(), N, H, L.wgate, I, Tensor(), gate_.data());
       linear(h_.data(), N, H, L.wup, I, Tensor(), up_.data());
       ref::silu_mul(gate_.data(), up_.data(), gate_.size());
@@ -199,10 +200,13 @@ class CudaModel final : public Model {
 
     if (logit_rows_.empty()) return;
     const int R = static_cast<int>(logit_rows_.size());
-    h_.resize(static_cast<size_t>(R) * H);
+    // Gather the rows that need logits into one contiguous block first, so the
+    // final norm is a single launch rather than one per row.
+    o_.resize(static_cast<size_t>(R) * H);
     for (int r = 0; r < R; r++)
-      ref::rmsnorm(&x_[static_cast<size_t>(logit_rows_[r]) * H], final_norm_.ptr(),
-                   &h_[static_cast<size_t>(r) * H], 1, H, cfg_.rms_norm_eps);
+      std::copy_n(&x_[static_cast<size_t>(logit_rows_[r]) * H], H, &o_[static_cast<size_t>(r) * H]);
+    h_.resize(static_cast<size_t>(R) * H);
+    rmsnorm_device(o_.data(), final_norm_dev_, h_.data(), R, H);
     linear(h_.data(), R, H, lm_head_, cfg_.vocab_size, Tensor(), logits.data());
   }
 
@@ -246,6 +250,28 @@ class CudaModel final : public Model {
 
     stage_c_.resize(count);
     CUDA_CHECK(cudaMemcpy(stage_c_.data(), d_x_, count * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
+  }
+
+  // Run an op on the device while its neighbours are still host-side: upload,
+  // launch, download. The transfers are pure overhead and all disappear in one
+  // go once every op in the layer is a kernel; until then they keep each new
+  // kernel verifiable on its own.
+  void rmsnorm_device(const float* in, const float* w_dev, float* out, int rows, int cols) {
+    const size_t count = static_cast<size_t>(rows) * cols;
+    ensure_capacity(&dA_, &dA_cap_, count);
+    ensure_capacity(&dC_, &dC_cap_, count);
+
+    stage_a_.resize(count);
+    for (size_t i = 0; i < count; i++) stage_a_[i] = f32_to_f16(in[i]);
+    CUDA_CHECK(cudaMemcpy(dA_, stage_a_.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
+
+    launch_rmsnorm(dA_, w_dev, dC_, rows, cols, cfg_.rms_norm_eps, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    stage_c_.resize(count);
+    CUDA_CHECK(cudaMemcpy(stage_c_.data(), dC_, count * sizeof(__half), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < count; i++) out[i] = f16_to_f32(stage_c_[i]);
   }
 

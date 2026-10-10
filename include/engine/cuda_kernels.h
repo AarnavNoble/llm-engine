@@ -18,6 +18,11 @@ namespace engine {
 void launch_embedding(const __half* table, const int32_t* ids, __half* out,
                       int n_tokens, int hidden, cudaStream_t stream);
 
+// out[r][j] = x[r][j] * rsqrt(mean(x[r]^2) + eps) * weight[j], one block per row.
+// `weight` is fp32 because the reference normalises in fp32.
+void launch_rmsnorm(const __half* x, const float* weight, __half* out,
+                    int rows, int cols, float eps, cudaStream_t stream);
+
 }  // namespace engine
 
 #endif  // ENGINE_CUDA
