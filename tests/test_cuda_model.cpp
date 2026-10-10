@@ -163,4 +163,75 @@ TEST_CASE("cuda model: greedy generation matches the CPU backend", "[cuda][model
   }
 }
 
+TEST_CASE("cuda model: attention follows a non-contiguous block table", "[cuda][model][slow]") {
+  // The decisive test for the paged kernel. Every other case allocates a fresh
+  // sequence, so its blocks come out contiguous and a kernel that computed the
+  // slot straight from the position would pass all of them. Here the pool is
+  // deliberately fragmented first, so the block table is out of order, and a
+  // kernel that ignores it reads the wrong history.
+  const std::string dir = ENGINE_MODEL_DIR;
+  const std::string data = std::string(ENGINE_TEST_DATA_DIR) + "/" +
+                           dir.substr(dir.find_last_of('/') + 1);
+  if (!std::filesystem::exists(data + "/prompts.json")) SKIP("no reference data");
+  auto P = load_prompts(data);
+
+  // The longest prompt spans the most blocks, so fragmentation shows up most.
+  size_t longest = 0;
+  for (size_t i = 0; i < P["prompts"].size(); i++)
+    if (P["prompts"][i]["ids"].size() > P["prompts"][longest]["ids"].size()) longest = i;
+  const auto ids = P["prompts"][longest]["ids"].get<std::vector<int32_t>>();
+
+  auto run = [&](bool cuda, bool fragment) {
+    KVCacheManager kv(256, 16, false);
+    auto model = cuda ? make_cuda_model(dir, kv) : make_cpu_model(dir, kv);
+
+    std::vector<BlockTable> held;
+    if (fragment) {
+      // Take a run of single-block sequences, then release every other one, so
+      // the free list hands back a shuffled set of block ids.
+      for (int i = 0; i < 40; i++) {
+        BlockTable bt;
+        std::vector<int32_t> one(8, 7000 + i);
+        REQUIRE(kv.allocate_prompt(bt, one).has_value());
+        held.push_back(bt);
+      }
+      for (size_t i = 0; i < held.size(); i += 2) kv.free(held[i]);
+    }
+
+    auto s = std::make_shared<Sequence>();
+    s->tokens = ids;
+    s->prompt_len = s->num_tokens();
+    REQUIRE(kv.allocate_prompt(s->block_table, s->tokens).has_value());
+
+    if (fragment) {
+      // Confirm the premise: the table really is not 0,1,2,...
+      bool contiguous = true;
+      for (int i = 1; i < s->block_table.num_blocks(); i++)
+        if (s->block_table.blocks[i] != s->block_table.blocks[i - 1] + 1) contiguous = false;
+      INFO("block table size " << s->block_table.num_blocks());
+      REQUIRE_FALSE(contiguous);
+    }
+
+    std::vector<float> out;
+    model->forward(whole_prompt(s.get()), out);
+    kv.free(s->block_table);
+    for (auto& bt : held) if (!bt.empty()) kv.free(bt);
+    return out;
+  };
+
+  const auto cpu = run(false, true);
+  const auto gpu = run(true, true);
+  REQUIRE(cpu.size() == gpu.size());
+
+  float worst = 0, mag = 0;
+  for (size_t i = 0; i < cpu.size(); i++) {
+    worst = std::max(worst, std::fabs(cpu[i] - gpu[i]));
+    mag = std::max(mag, std::fabs(cpu[i]));
+  }
+  INFO("max |cpu - gpu| = " << worst << " against max |cpu| = " << mag);
+  CHECK(worst < 0.5f);
+  CHECK(Sampler::argmax(gpu.data(), static_cast<int>(gpu.size())) ==
+        Sampler::argmax(cpu.data(), static_cast<int>(cpu.size())));
+}
+
 #endif  // ENGINE_CUDA
