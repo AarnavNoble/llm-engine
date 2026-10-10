@@ -82,9 +82,16 @@ if(ENGINE_CUDA AND ENGINE_CUDA_MISSING)
 endif()
 
 if(ENGINE_CUDA)
+  # The architecture has to be chosen *before* enable_language(CUDA): that call
+  # compiles a probe binary, and with no architecture set it tries to detect one
+  # and fails outright on some driver/toolkit pairs. Setting it afterwards looks
+  # correct and works only because every caller happened to pass the value on
+  # the command line, which populates the cache earlier than this file runs.
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "sm_89 = RTX 4090; 86 = A40/A6000")
+  endif()
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
-  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "sm_89 = RTX 4090")
   find_package(CUDAToolkit REQUIRED)
   # An OBJECT library rather than a static one: engine_core calls
   # make_cuda_model, which lives here, while this needs engine_core's headers.

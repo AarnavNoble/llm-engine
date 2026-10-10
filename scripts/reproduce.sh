@@ -55,8 +55,12 @@ BACKEND=cpu
 # say so and measure what exists rather than failing the whole run.
 if have_gpu; then
   if [ -f src/kernels/attention_decode.cu ]; then
-    CMAKE_ARGS+=(-DENGINE_CUDA=ON)
+    # Ask the device what it is rather than assuming the card the project was
+    # developed on. Falls back to sm_89 only if the query fails.
+    ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    CMAKE_ARGS+=(-DENGINE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${ARCH:-89}")
     BACKEND=cuda
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
   else
     echo "GPU present but the CUDA backend is not implemented yet; measuring the CPU backend."
     echo "See docs/gpu-setup.md for what remains."
@@ -67,7 +71,7 @@ cmake --build build >/dev/null
 # Exported, not just set: the sub-scripts read it from the environment, and
 # without this they would quietly measure the CPU backend and label it cuda.
 export BACKEND
-echo "backend: $BACKEND"
+echo "backend: $BACKEND${GPU_NAME:+ on $GPU_NAME (sm_$ARCH)}"
 # Guard against the trap this script would otherwise hide: a run labelled cuda
 # that silently used the CPU backend.
 if [ "$BACKEND" = cuda ]; then
