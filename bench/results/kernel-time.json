@@ -1,0 +1,14 @@
+{
+  "steps": 728,
+  "regions": [
+    {"region": "embedding", "ms_per_step": 0.011701, "share_pct": 0.032},
+    {"region": "rmsnorm", "ms_per_step": 0.304845, "share_pct": 0.846},
+    {"region": "qkv_proj", "ms_per_step": 1.027173, "share_pct": 2.849},
+    {"region": "rope+store_kv", "ms_per_step": 0.225446, "share_pct": 0.625},
+    {"region": "attention", "ms_per_step": 31.565698, "share_pct": 87.558},
+    {"region": "o_proj+residual", "ms_per_step": 0.320146, "share_pct": 0.888},
+    {"region": "mlp", "ms_per_step": 2.074334, "share_pct": 5.754},
+    {"region": "head", "ms_per_step": 0.521955, "share_pct": 1.448}
+  ],
+  "device_ms_per_step": 36.051297
+}

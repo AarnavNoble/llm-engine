@@ -68,6 +68,19 @@ Paged KV cache, continuous batching, prefix caching, OpenAI-compatible streaming
 <tr><td>wall clock</td><td>44.0 s</td><td>7.8 s</td><td><strong>5.7x faster</strong></td></tr>
 </tbody></table></div>
 <p>Block hit ratio 95.8%.</p>
+<h2>Where a decode step goes</h2>
+<p>CUDA events on the default stream, 32 concurrent requests, 36.05 ms of device time per step. Nsight Compute would give achieved bandwidth too and does not run on a rented pod, so this measures which region the time is in rather than how close each is to the memory limit. Recording events costs something, so read the proportions and not the absolute total.</p>
+<div class="scroll"><table>
+<thead><tr><th>Region</th><th>ms/step</th><th>Share</th></tr></thead><tbody>
+<tr><td><code>embedding</code></td><td>0.012</td><td>0.0%</td></tr>
+<tr><td><code>rmsnorm</code></td><td>0.305</td><td>0.8%</td></tr>
+<tr><td><code>qkv_proj</code></td><td>1.027</td><td>2.8%</td></tr>
+<tr><td><code>rope+store_kv</code></td><td>0.225</td><td>0.6%</td></tr>
+<tr><td><code>attention</code></td><td>31.566</td><td>87.6%</td></tr>
+<tr><td><code>o_proj+residual</code></td><td>0.320</td><td>0.9%</td></tr>
+<tr><td><code>mlp</code></td><td>2.074</td><td>5.8%</td></tr>
+<tr><td><code>head</code></td><td>0.522</td><td>1.4%</td></tr>
+</tbody></table></div>
 <h2>Chunked prefill</h2>
 <p>Four streams decoding while a 2,048-token prompt is injected mid-flight. The worst gap is what a user watching tokens appear actually feels; p95 over a few hundred samples hides a single long stall.</p>
 <div class="scroll"><table>

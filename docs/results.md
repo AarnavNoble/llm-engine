@@ -44,6 +44,21 @@ Allocator property, measured with a fake model, so it is hardware independent. 2
 | wall clock | 44.0 s | 7.8 s | **5.7x faster** |
 
 Block hit ratio 95.8%.
+## Where a decode step goes
+
+CUDA events on the default stream, 32 concurrent requests, 36.05 ms of device time per step. Nsight Compute would give achieved bandwidth too and does not run on a rented pod, so this measures which region the time is in rather than how close each is to the memory limit. Recording events costs something, so read the proportions and not the absolute total.
+
+| Region | ms/step | Share |
+|---|---|---|
+| `embedding` | 0.012 | 0.0% |
+| `rmsnorm` | 0.305 | 0.8% |
+| `qkv_proj` | 1.027 | 2.8% |
+| `rope+store_kv` | 0.225 | 0.6% |
+| `attention` | 31.566 | 87.6% |
+| `o_proj+residual` | 0.320 | 0.9% |
+| `mlp` | 2.074 | 5.8% |
+| `head` | 0.522 | 1.4% |
+
 
 ## Chunked prefill
 
