@@ -22,7 +22,7 @@ tables, with the protocol and what each figure does and does not mean, are in
 
 | Result | Number | Measured on |
 |---|---|---|
-| KV slot utilization, paged vs contiguous with a declared cap | **98.8%** vs 55.5% (1.7% reserving full context) | hardware independent |
+| KV slot utilization, paged vs contiguous with a declared cap | **99.0%** vs 54.8% (1.7% reserving full context) | hardware independent |
 | Continuous vs static batching, TTFT p50 | **38x faster** (5,952 ms to 157 ms) | A40, CUDA |
 | Continuous vs static batching, TTFT p95 | **79x faster** (12,896 ms to 163 ms) | A40, CUDA |
 | Continuous vs static batching, throughput | **1.18x** (327 to 386 tok/s) | A40, CUDA |
@@ -30,8 +30,8 @@ tables, with the protocol and what each figure does and does not mean, are in
 | Prefix caching, TTFT p50 on a shared 512-token prompt | **14.4x faster** (1,627 ms to 113 ms), 95.8% block hit ratio | A40, CUDA |
 | Chunked prefill, worst decode stall with a 2,048-token prompt injected | 47.8 ms to **36.8 ms** | A40, CUDA |
 | Continuous vs static batching, throughput | **1.47x** | 10-core Mac, CPU |
-| Chunked prefill, worst decode stall, same experiment | **11.8x smaller** (23.2 s to 2.0 s) | 10-core Mac, CPU |
-| Admission watermark, preemption recompute waste | **16.2% to 2.3%** of all token work, at 0.7% occupancy cost | hardware independent |
+| Continuous vs static batching, TTFT p50 | **5.9x faster** (13,673 ms to 2,330 ms) | 10-core Mac, CPU |
+| Admission watermark, preemption recompute waste | **17.1% to 4.7%** of all token work at 8,192 KV slots, 64 preemptions to 11 | hardware independent |
 | vLLM on the same model and GPU | **5,927 tok/s** against this engine's 386 | A40, CUDA |
 
 Three of these are worth reading twice, because they are not the result the
@@ -48,10 +48,10 @@ different bottleneck.
 advances on every step. That is the trade, and it is in the table rather than
 omitted from it.
 
-**Chunked prefill is nearly pointless on this hardware.** It was worth 11.8x on
-the CPU backend and is worth 1.3x here, for the same reason: a 2,048-token
-prefill takes about 37 ms on an A40, so there is barely a stall left to
-subtract. It would matter again with a larger model or longer prompts.
+**Chunked prefill is nearly pointless on this hardware.** It is worth 1.3x
+here, against a far larger margin on the CPU backend, for the same reason: a
+2,048-token prefill takes about 37 ms on an A40, so there is barely a stall
+left to subtract. It would matter again with a larger model or longer prompts.
 
 **vLLM is 15x faster, and that row is in the table on purpose.** A comparison
 nobody runs is worth less than one that is unflattering, and the shape of the

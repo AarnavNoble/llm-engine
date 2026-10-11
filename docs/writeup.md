@@ -78,7 +78,7 @@ could measure it on a laptop: drive the real block allocator and scheduler with
 a fake model, and compare against a simulated contiguous allocator on the same
 workload and memory budget.
 
-The first table said paged allocation reached 98.8% slot utilization against
+The first table said paged allocation reached 99.0% slot utilization against
 87.9% for contiguous — a thin win, and the static and continuous rows were
 *identical*, which made no sense.
 
@@ -94,9 +94,9 @@ cleanly:
 | strategy | slot utilization | sequences decoding |
 |---|---|---|
 | contiguous, reserve full context | 1.7% | 1.4 |
-| contiguous, reserve prompt + cap | 55.5% | 37.3 |
-| paged, static batching | 98.8% | 14.6 |
-| paged, continuous batching | **98.8%** | **41.1** |
+| contiguous, reserve prompt + cap | 54.8% | 20.2 |
+| paged, static batching | 98.6% | 11.7 |
+| paged, continuous batching | **99.0%** | **22.9** |
 
 Paging is what fixes memory. Continuous batching is what fixes occupancy. The
 gap between *resident* and *decoding* is exactly the capacity static batching
@@ -182,7 +182,7 @@ that fits is admitted and the engine cannot deadlock.
 | KV slots | preemptions | wasted work |
 |---|---|---|
 | 4,096 | 162 → 65 | 19.2% → **9.1%** |
-| 8,192 | 135 → 15 | 16.2% → **2.3%** |
+| 8,192 | 64 → 11 | 17.1% → **4.7%** |
 | 16,384 | 150 → 2 | 17.0% → **0.1%** |
 
 Monotonic now, at a 0.7% occupancy cost. Both columns come from the same run, so
@@ -218,7 +218,7 @@ Three habits, in order of how much they have been worth:
    because something was reported rather than checked.
 3. **Re-run published numbers when the code beneath them changes, and explain
    the shifts.** Batching the forward pass moved three published results. The
-   prefix cache hit ratio rose from 75% to its theoretical ceiling of 77.5%,
+   prefix cache hit ratio rose to its theoretical ceiling of 95.8%,
    because packing the step shrank the cold-start window to a single request.
    That is a satisfying explanation, and I would have missed it by quietly
    swapping the figure.

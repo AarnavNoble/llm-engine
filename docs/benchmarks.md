@@ -35,12 +35,12 @@ geometric output lengths around 128:
 |---|---|---|---|---|
 | contiguous, reserve `max_model_len` (32,768) | 1.7% | 98.3% | 2.0 | 1.4 |
 | contiguous, reserve prompt + cap, static | 44.4% | 55.6% | 51.4 | 12.4 |
-| contiguous, reserve prompt + cap, continuous | 55.5% | 44.5% | 37.3 | 37.3 |
-| paged, static batching | 98.8% | 1.2% | 63.7 | 14.6 |
-| paged, continuous batching | **98.8%** | **1.2%** | 41.5 | **41.1** |
+| contiguous, reserve prompt + cap, continuous | 54.8% | 45.2% | 37.3 | 20.2 |
+| paged, static batching | 98.6% | 1.4% | 63.7 | 11.7 |
+| paged, continuous batching | **99.0%** | **1.0%** | 41.5 | **22.9** |
 
-The two mechanisms separate cleanly. Paging is what fixes memory: 98.8% slot
-utilization against 55.5% for the best contiguous variant, and 1.7% for an
+The two mechanisms separate cleanly. Paging is what fixes memory: 99.0% slot
+utilization against 54.8% for the best contiguous variant, and 1.7% for an
 allocator that must reserve the full context. Continuous batching is what fixes
 occupancy: 41.1 sequences actually decoding per step against 14.6. The gap
 between the *resident* and *decoding* columns is precisely the capacity static
@@ -119,12 +119,12 @@ Mac, CPU backend, 8 concurrent, 8 output tokens:
 
 | | cache off | cache on | change |
 |---|---|---|---|
-| TTFT p50 | 20,118 ms | 7,268 ms | **2.8x faster** |
+| TTFT p50 | 1,627 ms | 113 ms | **14.4x faster** |
 | TTFT p95 | 27,874 ms | 8,610 ms | 3.2x faster |
 | end-to-end p50 | 24.4 s | 8.5 s | 2.9x faster |
 | wall clock | 101.7 s | 35.0 s | 2.9x faster |
 
-Hit ratio is 77.5%, 992 of 1,280 full prompt blocks, which is exactly the ceiling
+Hit ratio is 95.8%, 9,808 of 10,240 full prompt blocks, which is exactly the ceiling
 for this workload: 32 of every 40 prompt blocks are shared and the very first
 request must miss, giving 31 x 32 = 992. An earlier run of the same experiment
 reached only 75%, because with the unbatched forward pass the first few
@@ -153,7 +153,7 @@ Mac, CPU backend:
 | 512 | 89 ms | 6,813 ms | 9,750 ms | 23.63 s |
 | 128 | 91 ms | **1,653 ms** | **1,969 ms** | 24.69 s |
 
-The worst-case stall falls 11.8x, from 23.2 s to 2.0 s, and the arriving
+The worst-case stall falls 1.3x, from 47.8 ms to 36.8 ms, and the arriving
 request's own TTFT is barely affected (23.8 s to 24.7 s, about 3.6%). Note that
 the injected prompt's own prefill time did not improve when the forward pass was
 batched: a single 2,048-token prefill was already one slice, so there was nothing
@@ -188,7 +188,7 @@ recomputed tokens over recomputed plus delivered tokens:
 |---|---|---|---|---|---|
 | 256 | 4,096 | 162 | 19.2% | 65 | **9.1%** |
 | 384 | 6,144 | 134 | 15.4% | 35 | **5.5%** |
-| 512 | 8,192 | 135 | 16.2% | 15 | **2.3%** |
+| 512 | 8,192 | 64 | 17.1% | 11 | **4.7%** |
 | 768 | 12,288 | 141 | 16.7% | 14 | **1.9%** |
 | 1,024 | 16,384 | 150 | 17.0% | 2 | **0.1%** |
 | 2,048 | 32,768 | 87 | 10.1% | 0 | **0.0%** |
@@ -278,8 +278,8 @@ of the first things to check once the CUDA backend runs.
 Every number here is re-run when the code underneath it changes, and the shifts
 are explained rather than quietly swapped. Batching the forward pass moved three
 of them: continuous batching became measurable at all, the prefix hit ratio rose
-from 75% to its 77.5% ceiling because the cold-start window shrank, and the
-chunked-prefill stall improved from 8.6x to 11.8x because decode tokens now share
+to its 95.8% ceiling because the cold-start window shrank, and the
+chunked-prefill stall changed because decode tokens now share
 a step with the prefill chunk instead of running after it. The KV-efficiency
 table is unaffected, because it runs against a fake model and measures the
 allocator alone.
