@@ -28,21 +28,21 @@ allocator, so `bench/kv_waste.cpp` measures it anywhere. It drives the real
 baseline is simulated, because the engine never implements contiguous
 allocation.
 
-512 requests, 65,536 KV slots (4,096 blocks of 16), `max_num_seqs` 64,
+256 requests, 65,536 KV slots (4,096 blocks of 16), `max_num_seqs` 64,
 geometric output lengths around 128:
 
 | strategy | slot util | KV waste | resident seqs | decoding seqs |
 |---|---|---|---|---|
-| contiguous, reserve `max_model_len` (32,768) | 1.7% | 98.3% | 2.0 | 1.4 |
-| contiguous, reserve prompt + cap, static | 44.4% | 55.6% | 51.4 | 12.4 |
-| contiguous, reserve prompt + cap, continuous | 54.8% | 45.2% | 37.3 | 20.2 |
-| paged, static batching | 98.6% | 1.4% | 63.7 | 11.7 |
-| paged, continuous batching | **99.0%** | **1.0%** | 41.5 | **22.9** |
+| contiguous, reserve `max_model_len` (32,768) | 1.7% | 98.3% | 2.0 | 1.3 |
+| contiguous, reserve prompt + cap, static | 35.2% | 64.8% | 42.0 | 8.4 |
+| contiguous, reserve prompt + cap, continuous | 54.8% | 45.2% | 20.2 | 20.2 |
+| paged, static batching | 98.6% | 1.4% | 63.8 | 11.7 |
+| paged, continuous batching | **99.0%** | **1.0%** | 23.1 | **22.9** |
 
 The two mechanisms separate cleanly. Paging is what fixes memory: 99.0% slot
 utilization against 54.8% for the best contiguous variant, and 1.7% for an
 allocator that must reserve the full context. Continuous batching is what fixes
-occupancy: 41.1 sequences actually decoding per step against 14.6. The gap
+occupancy: 22.9 sequences actually decoding per step against 11.7. The gap
 between the *resident* and *decoding* columns is precisely the capacity static
 batching burns on finished sequences that still hold their blocks.
 
@@ -181,7 +181,7 @@ reported by `kv_waste --sweep`, which now measures the admission watermark off
 and on in the same run rather than quoting a number remembered from whenever it
 was first taken.
 
-512 requests, geometric outputs around 128, `max_num_seqs` 64. Wasted work is
+256 requests, geometric outputs around 128, `max_num_seqs` 64. Wasted work is
 recomputed tokens over recomputed plus delivered tokens:
 
 | blocks | KV slots | preemptions, no watermark | wasted | preemptions, watermark | wasted |

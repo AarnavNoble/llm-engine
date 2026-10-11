@@ -86,6 +86,20 @@ CLAIMS = [
      lambda: kv("paged, continuous batching", "mean_active_seqs"), "{:.1f}"),
     ("static sequences decoding", ["docs/benchmarks.md"],
      lambda: kv("paged, static batching", "mean_active_seqs"), "{:.1f}"),
+    # Registered after a round of doc edits left eight figures stale that this
+    # script passed over: it checks claims someone thought to name, so a column
+    # nobody registered drifts silently. These are the rest of the allocator
+    # table and the workload it was run at.
+    ("paged resident seqs", ["docs/benchmarks.md"],
+     lambda: kv("paged, continuous batching", "mean_resident_seqs"), "{:.1f}"),
+    ("static resident seqs", ["docs/benchmarks.md"],
+     lambda: kv("paged, static batching", "mean_resident_seqs"), "{:.1f}"),
+    ("paged KV waste", ["docs/benchmarks.md"],
+     lambda: kv("paged, continuous batching", "kv_waste_fraction") * 100, "{:.1f}%"),
+    ("contiguous KV waste", ["docs/benchmarks.md"],
+     lambda: kv("contiguous (reserve prompt + max_tokens)", "kv_waste_fraction") * 100, "{:.1f}%"),
+    ("allocator workload requests", ["docs/benchmarks.md"],
+     lambda: json.loads((RESULTS / "kv-waste.json").read_text())["workload"]["requests"], "{:d}"),
     ("continuous tokens/s", ["docs/benchmarks.md", "docs/writeup.md"],
      lambda: last("cpu-continuous", "tokens_per_s"), "{:.1f}"),
     ("static tokens/s", ["docs/benchmarks.md", "docs/writeup.md"],

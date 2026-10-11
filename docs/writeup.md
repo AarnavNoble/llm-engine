@@ -93,7 +93,7 @@ cleanly:
 
 | strategy | slot utilization | sequences decoding |
 |---|---|---|
-| contiguous, reserve full context | 1.7% | 1.4 |
+| contiguous, reserve full context | 1.7% | 1.3 |
 | contiguous, reserve prompt + cap | 54.8% | 20.2 |
 | paged, static batching | 98.6% | 11.7 |
 | paged, continuous batching | **99.0%** | **22.9** |
