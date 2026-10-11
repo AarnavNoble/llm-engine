@@ -501,7 +501,36 @@ single `cudaDeviceSynchronize` at the end of the step, which lets the launches
 overlap. Every CUDA and cuBLAS call goes through a macro that reports file, line
 and the error string, from the first line of code in the file.
 
-The cost of a step, and how much of it is attention: `TODO(gpu)`.
+The cost of a step, and how much of it is attention: **36.05 ms on an A40 at
+32 concurrent requests, and 87.6% of it is attention** -- 31.57 ms of the 36.05,
+measured with CUDA events over 728 steps. The rest is barely worth naming: the
+MLP is 5.8%, the QKV projection 2.8%, the head 1.4%, RoPE and the cache write
+0.6% between them, the embedding 0.03%.
+
+That number exists because the obvious guess was wrong. The vLLM comparison
+had localised the inter-token deficit to per-step cost, and the natural
+inference from there was the host: every step copies 32 x 151,936 fp16 logits
+back and widens them one value at a time with a branchy software conversion,
+which is easy to estimate at tens of milliseconds and easy to believe. Acting
+on that would have meant writing a device sampler to optimise something worth
+1.4% of device time.
+
+It also bounds the host cost rather than dismissing it. 36 ms of device time
+against roughly 80 ms of measured inter-token latency leaves about half the
+step outside the kernels, and that half is the host-side work. Both are real.
+Attention is simply the larger single item and the one a kernel can address.
+
+Why it is slow is legible in the kernel rather than mysterious: one block per
+(token, head), 64 threads, scalar fp32 accumulation, no tensor cores, and with
+GQA group 7 each of seven query heads re-reads the same kv head's history from
+global memory independently. One block per (sequence, kv_head) serving all
+seven removes a sevenfold redundant read of the largest structure in the step.
+
+Nsight Compute would have added achieved bandwidth per kernel and does not run
+on a rented pod: it needs `NVreg_RestrictProfilingToAdminUsers=0`, a host
+kernel-module parameter a container cannot set, and returns `ERR_NVGPUCTRPERM`
+without it. CUDA events need no privileges and answered the question that
+actually decided what to do next.
 
 ## `--backend cuda` ran on the CPU and reported success
 
