@@ -22,6 +22,49 @@ jobs:
       - name: test
         run: ./build/tests/engine_tests "~[model]"
 
+  # Sanitizers, on Linux only.
+  #
+  # The project's claim is correctness, and 899k assertions say nothing about
+  # undefined behaviour or data races: a read of uninitialised memory or a
+  # torn read between the engine thread and an API thread can produce a
+  # perfectly plausible token and pass every one of them. These are the checks
+  # that look underneath the assertions.
+  #
+  # ASan and TSan cannot be combined, so they are separate configurations.
+  # UBSan rides along with ASan. TSan was skipped during development because
+  # it segfaults on macOS 26 arm64 on a two-thread hello world; that is a Mac
+  # toolchain problem and does not apply here, which is the point of running
+  # it in CI rather than locally.
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, thread]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libopenblas-dev
+      - name: configure
+        # RelWithDebInfo, not Debug: the concurrency tests need to run in
+        # reasonable time, and symbolized frames need the debug info.
+        run: |
+          EXTRA="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
+          [ "${{ matrix.san }}" = address ] && EXTRA="$EXTRA -fsanitize=undefined"
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="$EXTRA" -DCMAKE_CXX_FLAGS="$EXTRA" \
+            -DCMAKE_EXE_LINKER_FLAGS="$EXTRA"
+      - name: build
+        run: cmake --build build-san
+      - name: test
+        # halt_on_error so a finding fails the job instead of being a log line
+        # nobody reads. The model tests need weights CI does not have.
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ./build-san/tests/engine_tests "~[model]"
+
   deploy-manifests:
     runs-on: ubuntu-24.04
     steps:
