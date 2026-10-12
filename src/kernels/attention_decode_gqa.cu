@@ -47,7 +47,26 @@ namespace engine {
 namespace {
 
 constexpr int kWarp = 32;
-constexpr int kWarps = 4;                      // 128 threads
+// 16 warps, 512 threads. Measured, not chosen: at 4 warps this kernel was
+// 1.33x SLOWER than the one it replaces, and the reason was occupancy rather
+// than anything in the arithmetic. One block per (token, kv head) instead of
+// per (token, query head) means 7x fewer blocks -- 64 instead of 448 at 32
+// concurrent requests -- and 64 blocks do not fill an A40's 84 SMs. The saved
+// bandwidth could not pay for a GPU that was three quarters idle.
+//
+// Threads per block are the one knob that compensates, since the grid is fixed
+// by the decomposition. attention ms/step across the sweep, 728 steps at
+// concurrency 32:
+//
+//     baseline (per token, head)   31.56
+//     4 warps, 128 threads         41.90    1.33x slower
+//     8 warps, 256 threads         37.42    1.19x slower
+//    16 warps, 512 threads         19.47    1.62x faster
+//
+// 16 is close to the ceiling: the per-warp partials are kWarps * group *
+// (head_dim + 2) floats, so 24 warps at group 8 would want 50 KiB against a
+// 48 KiB limit.
+constexpr int kWarps = 16;
 constexpr int kThreadsG = kWarp * kWarps;
 constexpr int kMaxGroup = 8;                   // Qwen2.5 is 7, TinyLlama is 8
 constexpr int kMaxHeadDim = 128;
