@@ -53,6 +53,16 @@ void launch_attention_decode(const __half* q, const __half* k_cache, const __hal
                              int n_tokens, int q_heads, int kv_heads, int head_dim,
                              int block_size, float scale, cudaStream_t stream);
 
+// Same computation, one block per (token, kv head) instead of per (token, query
+// head), so a GQA group reads each position's K and V once between them rather
+// than once each. Selected at runtime by cuda_model so the two can be compared;
+// see src/kernels/attention_decode_gqa.cu.
+void launch_attention_decode_gqa(const __half* q, const __half* k_cache, const __half* v_cache,
+                                 const int* block_tables, const int* table_offset,
+                                 const int* token_seq, const int* token_pos, __half* out,
+                                 int n_tokens, int q_heads, int kv_heads, int head_dim,
+                                 int block_size, float scale, cudaStream_t stream);
+
 }  // namespace engine
 
 #endif  // ENGINE_CUDA

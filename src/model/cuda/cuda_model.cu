@@ -366,9 +366,14 @@ class CudaModel final : public Model {
       launch_rope(k, d_positions_, d_cos_, d_sin_, N, nkv, hd, kv_dim_, nullptr);
       launch_store_kv(k, v, d_slots_, k_cache_[l], v_cache_[l], N, kv_dim_, nullptr); }
       { ProfScope _(prof_, kAttn);
-      launch_attention_decode(q, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
-                              d_token_seq_, d_positions_, attn, N, nh, nkv, hd, bs, scale,
-                              nullptr); }
+      if (gqa_attn_)
+        launch_attention_decode_gqa(q, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
+                                    d_token_seq_, d_positions_, attn, N, nh, nkv, hd, bs, scale,
+                                    nullptr);
+      else
+        launch_attention_decode(q, k_cache_[l], v_cache_[l], d_tables_, d_table_offset_,
+                                d_token_seq_, d_positions_, attn, N, nh, nkv, hd, bs, scale,
+                                nullptr); }
 
       { ProfScope _(prof_, kProjO);
       gemm(attn, L.wo, o, N, H, H);
@@ -534,6 +539,14 @@ class CudaModel final : public Model {
   // report_memory() claims to be printing.
   size_t weights_bytes_ = 0;
   StepProfile prof_;
+  // Which attention kernel runs. Default is the per-(token, head) one, because
+  // it is the one every published number was measured with; the group-sharing
+  // kernel takes over only when asked, so a before-and-after is one env var
+  // rather than two builds. ENGINE_ATTN=gqa selects it.
+  bool gqa_attn_ = [] {
+    const char* e = std::getenv("ENGINE_ATTN");
+    return e && std::string(e) == "gqa";
+  }();
 
   __half* embed_ = nullptr;
   __half* lm_head_ = nullptr;

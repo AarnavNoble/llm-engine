@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -289,6 +290,57 @@ TEST_CASE("cuda model: destroying a model returns its device memory", "[cuda][mo
     // far below one leaked model and far above driver noise.
     CHECK(base - now < 256);
   }
+}
+
+TEST_CASE("cuda model: group-sharing attention matches the baseline kernel", "[cuda][model][slow]") {
+  // attention_decode_gqa.cu computes the same thing as attention_decode.cu with
+  // a different decomposition: one block per (token, kv head) rather than per
+  // (token, query head), so a GQA group reads each position's K and V once
+  // between them. The arithmetic is meant to be identical, so greedy output
+  // must be identical too, not merely close.
+  //
+  // Run with fragmentation and several sequences, because that is where a
+  // decomposition change is most likely to go wrong: the new kernel indexes
+  // the concatenated block tables from a different grid dimension, and a
+  // mistake there reads another sequence's history and still returns
+  // plausible tokens.
+  const std::string dir = ENGINE_MODEL_DIR;
+  auto prompts = load_prompt_ids(dir, 3);
+  if (prompts.size() < 3) SKIP("need several prompts");
+
+  RunOpts o;
+  o.cuda = true;
+  o.fragment_blocks = 40;
+
+  setenv("ENGINE_ATTN", "", 1);
+  const auto baseline = greedy_run(dir, prompts, o);
+  setenv("ENGINE_ATTN", "gqa", 1);
+  const auto shared = greedy_run(dir, prompts, o);
+  unsetenv("ENGINE_ATTN");
+
+  require_same(baseline, shared);
+}
+
+TEST_CASE("cuda model: group-sharing attention holds at GQA group 8", "[cuda][model][slow]") {
+  // Qwen2.5-0.5B has a group of 7 and TinyLlama a group of 8, which is the
+  // kernel's declared maximum. Running both is the only way the boundary gets
+  // touched, and an off-by-one in the per-head register array would be
+  // invisible at 7.
+  const std::string dir = ENGINE_MODEL_DIR_2;
+  if (!std::filesystem::exists(dir + "/config.json")) SKIP("second model not downloaded");
+  auto prompts = load_prompt_ids(dir, 8);
+  if (prompts.empty()) SKIP("no reference data for the second model");
+
+  RunOpts o;
+  o.cuda = true;
+
+  setenv("ENGINE_ATTN", "", 1);
+  const auto baseline = greedy_run(dir, prompts, o);
+  setenv("ENGINE_ATTN", "gqa", 1);
+  const auto shared = greedy_run(dir, prompts, o);
+  unsetenv("ENGINE_ATTN");
+
+  require_same(baseline, shared);
 }
 
 #endif  // ENGINE_CUDA

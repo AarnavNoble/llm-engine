@@ -71,6 +71,7 @@ set(ENGINE_CUDA_SOURCES
   src/kernels/elementwise.cu
   src/kernels/store_kv.cu
   src/kernels/attention_decode.cu
+  src/kernels/attention_decode_gqa.cu
   src/kernels/attention_prefill.cu
   src/kernels/sampling.cu
 )
