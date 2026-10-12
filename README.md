@@ -106,6 +106,23 @@ client ──HTTP/SSE──▶ api/         /v1/completions  /v1/chat/completion
                                    kernel, and sampling is still done on the host)
 ```
 
+## Watch the scheduler
+
+```bash
+./build/engine serve --model models/Qwen2.5-0.5B-Instruct   # then open http://localhost:8000
+```
+
+The engine serves a live view of its own scheduler at `/`. It is not a chat
+UI: streaming text into a box demonstrates nothing an inference server does.
+It shows the three mechanisms that are invisible from a terminal and hard to
+describe in prose. Requests joining a batch that is already running, one per
+second, rather than waiting for it to drain. Six prompts sharing one system
+prompt, where the prefix is stored once and five of them skip prefill for it.
+And forty-eight at once, past what the pool holds, where preemptions rise as
+the scheduler evicts live sequences and recomputes them later.
+
+Each button says what to watch before it runs.
+
 ## Quickstart
 
 ```bash

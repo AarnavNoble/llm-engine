@@ -1,0 +1,322 @@
+<!doctype html>
+<!--
+  A live view of the scheduler, served by the engine itself.
+
+  The three mechanisms this project is actually about are invisible from a
+  terminal. A request joining a batch on the next step rather than after the
+  current one drains, two prompts sharing physical blocks because they start
+  with the same text, and a sequence being preempted and recomputed when the
+  pool runs out all look the same from outside: tokens arrive. This page is
+  the smallest thing that makes them visible while they happen.
+
+  It is deliberately not a chat UI. Streaming text into a box demonstrates
+  nothing about an inference server that a thirty-line script does not.
+
+  Served from the engine so that /metrics is same-origin; the server sets no
+  CORS headers, and adding them to run a page off the filesystem would be a
+  production-facing change for a demo's convenience.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>engine — scheduler</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161922; --line:#242936; --text:#e6e9ef; --dim:#8b93a7;
+    --accent:#6ea8fe; --warm:#f0a35e; --good:#5ec98b; --bad:#e2676a; --cache:#a98bdc;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  .sub { color:var(--dim); font-size:12px; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .up { background:var(--good); } .down { background:var(--bad); }
+  main { display:grid; grid-template-columns:1.35fr 1fr; gap:1px; background:var(--line);
+         min-height:calc(100vh - 56px); }
+  section { background:var(--bg); padding:16px 20px; min-width:0; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--dim);
+       margin:0 0 12px; font-weight:600; }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--line);
+           padding:7px 11px; border-radius:6px; cursor:pointer; font:inherit; font-size:12px; }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.4; cursor:default; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+  .hint { color:var(--dim); font-size:12px; margin:0 0 16px; min-height:2.6em; }
+  .hint b { color:var(--warm); font-weight:600; }
+
+  .lane { border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:6px;
+          background:var(--panel); }
+  .lane-top { display:flex; gap:10px; align-items:center; font-size:11px; color:var(--dim); }
+  .badge { padding:1px 7px; border-radius:10px; font-size:10px; letter-spacing:.04em; }
+  .b-wait { background:#2a2f3d; color:var(--dim); }
+  .b-run  { background:#1d3557; color:var(--accent); }
+  .b-done { background:#1b3a2c; color:var(--good); }
+  .b-err  { background:#3a1f21; color:var(--bad); }
+  .toks { margin-left:auto; font-variant-numeric:tabular-nums; }
+  .text { font-size:12px; color:var(--text); margin-top:5px; white-space:pre-wrap;
+          word-break:break-word; max-height:3.2em; overflow:hidden; opacity:.85; }
+
+  .stat { display:flex; justify-content:space-between; padding:5px 0;
+          border-bottom:1px solid var(--line); font-size:12px; }
+  .stat span:last-child { font-variant-numeric:tabular-nums; }
+  .big { font-size:26px; font-variant-numeric:tabular-nums; margin:2px 0 14px; }
+
+  .bar { height:22px; border-radius:4px; overflow:hidden; display:flex;
+         border:1px solid var(--line); background:var(--panel); margin:6px 0 4px; }
+  .bar i { display:block; height:100%; transition:width .25s ease; }
+  .legend { display:flex; gap:14px; font-size:11px; color:var(--dim); margin-bottom:16px; }
+  .sw { width:9px; height:9px; border-radius:2px; display:inline-block; margin-right:5px; }
+
+  canvas { width:100%; height:56px; display:block; margin-bottom:4px; }
+  .flash { animation:fl 1.1s ease; }
+  @keyframes fl { 0%{background:#3a1f21;} 100%{background:var(--bg);} }
+  @media (max-width:860px){ main{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>engine</h1>
+  <span class="sub"><span id="dot" class="dot down"></span><span id="status">connecting</span></span>
+  <span class="sub" id="model"></span>
+  <span class="sub" style="margin-left:auto">watch the right-hand column, not the text</span>
+</header>
+
+<main>
+<section>
+  <h2>Requests</h2>
+  <div class="controls">
+    <button id="b-burst">Send 8 requests</button>
+    <button id="b-stagger">Stagger 6, one per second</button>
+    <button id="b-prefix">6 sharing a long prefix</button>
+    <button id="b-long">Inject a 2,000-word prompt</button>
+    <button id="b-flood">Oversubscribe (48)</button>
+    <button id="b-clear">Clear</button>
+  </div>
+  <p class="hint" id="hint">Each button demonstrates one mechanism. Start with <b>Stagger</b>
+    and watch requests join a batch that is already running.</p>
+  <div id="lanes"></div>
+</section>
+
+<section>
+  <h2>KV cache</h2>
+  <div class="bar" id="kvbar">
+    <i id="kv-used"  style="width:0%;background:var(--accent)"></i>
+    <i id="kv-cache" style="width:0%;background:var(--cache)"></i>
+    <i id="kv-free"  style="width:100%;background:#20242e"></i>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--accent)"></i>in use <b id="n-used">0</b></span>
+    <span><i class="sw" style="background:var(--cache)"></i>cached <b id="n-cache">0</b></span>
+    <span><i class="sw" style="background:#20242e"></i>free <b id="n-free">0</b></span>
+  </div>
+
+  <h2>Throughput</h2>
+  <div class="big"><span id="tps">0</span> <span class="sub">tok/s</span></div>
+  <canvas id="spark" width="600" height="56"></canvas>
+
+  <h2>Scheduler</h2>
+  <div class="stat"><span>decoding now</span><span id="s-run">0</span></div>
+  <div class="stat"><span>waiting in queue</span><span id="s-q">0</span></div>
+  <div class="stat"><span>preemptions</span><span id="s-pre">0</span></div>
+  <div class="stat"><span>recomputed tokens</span><span id="s-rec">0</span></div>
+  <div class="stat"><span>prefix blocks reused</span><span id="s-hit">0</span></div>
+  <div class="stat"><span>prefix hit ratio</span><span id="s-ratio">—</span></div>
+  <div class="stat"><span>KV waste</span><span id="s-waste">—</span></div>
+  <div class="stat"><span>steps</span><span id="s-steps">0</span></div>
+</section>
+</main>
+
+<script>
+// ---------------------------------------------------------------- metrics
+// Prometheus text format. Only bare `name value` lines are wanted; histogram
+// buckets carry labels and are skipped.
+function parseMetrics(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    if (!line || line[0] === '#') continue;
+    const sp = line.indexOf(' ');
+    if (sp < 0) continue;
+    const name = line.slice(0, sp);
+    if (name.includes('{')) continue;
+    const v = Number(line.slice(sp + 1));
+    if (!Number.isNaN(v)) out[name] = v;
+  }
+  return out;
+}
+
+const $ = id => document.getElementById(id);
+const hist = [];
+let lastPre = null;
+
+async function poll() {
+  try {
+    const m = parseMetrics(await (await fetch('/metrics', {cache:'no-store'})).text());
+    $('dot').className = 'dot up';
+    $('status').textContent = 'connected';
+
+    const total = m.engine_kv_blocks_total || 1;
+    const used = m.engine_kv_blocks_used || 0, cached = m.engine_kv_blocks_cached || 0;
+    const free = Math.max(0, total - used - cached);
+    $('kv-used').style.width  = (100 * used / total) + '%';
+    $('kv-cache').style.width = (100 * cached / total) + '%';
+    $('kv-free').style.width  = (100 * free / total) + '%';
+    $('n-used').textContent = used.toLocaleString();
+    $('n-cache').textContent = cached.toLocaleString();
+    $('n-free').textContent = free.toLocaleString();
+
+    const tps = m.engine_tokens_per_second || 0;
+    $('tps').textContent = tps.toFixed(0);
+    hist.push(tps); if (hist.length > 160) hist.shift();
+    drawSpark();
+
+    $('s-run').textContent = (m.engine_running_seqs || 0).toFixed(0);
+    $('s-q').textContent = (m.engine_queue_depth || 0).toFixed(0);
+    $('s-rec').textContent = (m.engine_recomputed_tokens_total || 0).toLocaleString();
+    $('s-hit').textContent = (m.engine_prefix_cache_hit_blocks_total || 0).toLocaleString();
+    $('s-steps').textContent = (m.engine_steps_total || 0).toLocaleString();
+    $('s-waste').textContent = m.engine_kv_waste_fraction === undefined
+      ? '—' : (100 * m.engine_kv_waste_fraction).toFixed(1) + '%';
+
+    const q = m.engine_prefix_cache_total_blocks_total || 0;
+    $('s-ratio').textContent = q
+      ? (100 * (m.engine_prefix_cache_hit_blocks_total || 0) / q).toFixed(1) + '%' : '—';
+
+    // A preemption is the one event worth interrupting the eye for: it means
+    // the pool filled and the scheduler evicted a live sequence to make room.
+    const pre = m.engine_preemptions_total || 0;
+    $('s-pre').textContent = pre.toLocaleString();
+    if (lastPre !== null && pre > lastPre) {
+      const el = $('s-pre').parentElement;
+      el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    }
+    lastPre = pre;
+  } catch {
+    $('dot').className = 'dot down';
+    $('status').textContent = 'no server on this port';
+  }
+}
+
+function drawSpark() {
+  const c = $('spark'), ctx = c.getContext('2d');
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  if (hist.length < 2) return;
+  const max = Math.max(...hist, 1);
+  ctx.beginPath();
+  hist.forEach((v, i) => {
+    const x = w * i / (hist.length - 1), y = h - (h - 6) * v / max - 3;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = '#6ea8fe'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = 'rgba(110,168,254,.12)'; ctx.fill();
+}
+
+// ---------------------------------------------------------------- requests
+let n = 0;
+function lane(label) {
+  const id = ++n;
+  const el = document.createElement('div');
+  el.className = 'lane';
+  el.innerHTML = `<div class="lane-top"><span>#${id}</span>
+      <span class="badge b-wait" data-badge>queued</span>
+      <span style="color:var(--dim)">${label}</span>
+      <span class="toks" data-toks>0 tok</span></div>
+    <div class="text" data-text></div>`;
+  $('lanes').prepend(el);
+  while ($('lanes').children.length > 60) $('lanes').lastChild.remove();
+  return el;
+}
+
+async function send(prompt, label, maxTokens = 96) {
+  const el = lane(label);
+  const badge = el.querySelector('[data-badge]');
+  const toks = el.querySelector('[data-toks]');
+  const text = el.querySelector('[data-text]');
+  let count = 0;
+  try {
+    const r = await fetch('/v1/completions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt, max_tokens: maxTokens, temperature: 0, stream: true})
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 120));
+    badge.className = 'badge b-run'; badge.textContent = 'decoding';
+
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!frame.startsWith('data: ')) continue;
+        const body = frame.slice(6);
+        if (body === '[DONE]') continue;
+        try {
+          const piece = JSON.parse(body).choices?.[0]?.text || '';
+          if (piece) { count++; text.textContent += piece; toks.textContent = count + ' tok'; }
+        } catch {}
+      }
+    }
+    badge.className = 'badge b-done'; badge.textContent = 'done';
+  } catch (e) {
+    badge.className = 'badge b-err'; badge.textContent = 'failed';
+    text.textContent = String(e.message || e);
+  }
+}
+
+// Prompts chosen so the mechanisms are visible, not so the output is good.
+const SHARED = ('You are a careful systems engineer. Answer precisely and briefly. ' +
+  'Consider memory layout, concurrency and failure modes before you answer. ').repeat(14);
+const TOPICS = ['paged attention', 'continuous batching', 'a KV cache', 'prefill and decode',
+                'GPU occupancy', 'preemption', 'prefix caching', 'an online softmax'];
+const pick = i => 'Explain ' + TOPICS[i % TOPICS.length] + ' in two sentences.';
+
+function hint(html) { $('hint').innerHTML = html; }
+
+$('b-burst').onclick = () => {
+  hint('Eight at once. <b>decoding now</b> climbs as they are admitted together, and KV blocks fill in step.');
+  for (let i = 0; i < 8; i++) send(pick(i), 'burst');
+};
+
+$('b-stagger').onclick = () => {
+  hint('One per second into a batch that is already running. Each joins on the <b>next step</b>, not after the others finish — that is continuous batching, and static batching is what it would look like if the count only ever went down.');
+  let i = 0;
+  const t = setInterval(() => { send(pick(i), 'staggered'); if (++i >= 6) clearInterval(t); }, 1000);
+};
+
+$('b-prefix').onclick = async () => {
+  hint('One request first, then five more sharing its system prompt. <b>prefix blocks reused</b> jumps and the cached slice of the bar grows: the prefix is stored once and pointed at five more times.');
+  // Seed, then wait. Fired together none of them has finished prefill yet, so
+  // there are no published blocks to hit and the counter stays at zero -- the
+  // cache would look broken while working exactly as designed.
+  send(SHARED + pick(0), 'seeds the prefix');
+  await new Promise(r => setTimeout(r, 2500));
+  for (let i = 1; i < 6; i++) send(SHARED + pick(i), 'reuses the prefix');
+};
+
+$('b-long').onclick = () => {
+  hint('One very long prompt while others decode. Chunked prefill splits it so it cannot stall them — watch the running requests keep producing tokens instead of pausing.');
+  send(('The following is a long document that must be read in full. ').repeat(170) +
+       ' Summarise the document in one sentence.', 'long prompt', 48);
+};
+
+$('b-flood').onclick = () => {
+  hint('Forty-eight at once, past what the pool holds. Expect <b>preemptions</b> to rise and flash: the scheduler evicts a live sequence, frees its blocks, and recomputes it later. Some requests may be rejected outright, which is load shedding doing its job.');
+  for (let i = 0; i < 48; i++) send(pick(i), 'flood', 160);
+};
+
+$('b-clear').onclick = () => { $('lanes').innerHTML = ''; hint('Cleared. Counters are server-side and keep their totals.'); };
+
+fetch('/v1/models').then(r => r.json())
+  .then(j => { $('model').textContent = j.data?.[0]?.id || ''; }).catch(() => {});
+poll(); setInterval(poll, 400);
+</script>
+</body>
+</html>

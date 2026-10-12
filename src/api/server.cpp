@@ -3,7 +3,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -97,6 +99,24 @@ ApiServer::ApiServer(Engine& engine) : engine_(engine), svr_(std::make_unique<ht
   });
   svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
     res.set_content(engine_.metrics().render_prometheus(), "text/plain; version=0.0.4");
+  });
+  // The scheduler view at web/demo.html, served from the engine rather than
+  // opened off the filesystem. A page on file:// cannot read /metrics without
+  // CORS headers, and adding those to a server that is meant to sit behind an
+  // ingress would be a production-facing change made for a demo's
+  // convenience. Read from disk each time so editing the page needs no
+  // rebuild, and absent in a container image, where it simply 404s.
+  svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+    std::ifstream f("web/demo.html", std::ios::binary);
+    if (!f) {
+      res.status = 404;
+      res.set_content("web/demo.html not found. Run the server from the repository root.\n",
+                      "text/plain");
+      return;
+    }
+    std::stringstream b;
+    b << f.rdbuf();
+    res.set_content(b.str(), "text/html; charset=utf-8");
   });
   svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
     res.set_content(json{{"object", "list"}, {"data", {{{"id", engine_.engine_config().model_dir}, {"object", "model"}, {"owned_by", "engine"}}}}}.dump(), "application/json");
