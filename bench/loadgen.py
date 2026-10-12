@@ -39,6 +39,25 @@ def machine_label():
     return platform.processor() or platform.machine() or "unknown"
 
 
+def instance_label():
+    """Which rented box this is, not just which model of card.
+
+    Two A40 pods measured 386 and 771 tok/s on identical code, with the same
+    GPU model, the same Xeon 6342 and the same vCPU allocation -- a factor of
+    two that the hardware label could not distinguish, because both were
+    honestly "NVIDIA A40". Absolute throughput is a property of the instance,
+    so the instance has to be recorded or two of them silently share a row.
+    """
+    import os
+    pod = os.environ.get("RUNPOD_POD_ID")
+    if pod:
+        return "pod " + pod[:8]
+    try:
+        return platform.node()[:16] or None
+    except Exception:
+        return None
+
+
 def results_dir():
     """Where to record runs. ENGINE_RESULTS_DIR keeps a smoke run from
     overwriting the published numbers in bench/results/."""
@@ -144,6 +163,7 @@ async def main(a):
         # them. The number has to travel with its hardware or the table
         # misattributes it.
         "machine": machine_label(),
+        "instance": instance_label(),
         "tag": a.tag, "concurrency": a.concurrency, "num_requests": a.num_requests, "output_len": a.output_len,
         "output_dist": a.output_dist, "mean_output_len": sum(outs) / len(outs), "max_output_len": max(outs),
         "rate": a.rate,

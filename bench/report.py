@@ -105,7 +105,10 @@ def serving_rows():
         # rows here were taken on a laptop and the GPU rows on a rented A40 --
         # and one hardware line above the table silently claims a single
         # machine for all of them.
-        machines = sorted({r["machine"] for r in runs if r.get("machine")})
+        # Instance, not just hardware model: two A40 pods differed by 2x on
+        # identical code, and "NVIDIA A40" described both of them correctly.
+        machines = sorted({(r["machine"] + (f" / {r['instance']}" if r.get("instance") else ""))
+                           for r in runs if r.get("machine")})
         # A backfilled label was derived afterwards from the run's env.json
         # rather than recorded by the run itself, and says so.
         back = any(r.get("machine_backfilled") for r in runs)
@@ -146,11 +149,15 @@ def prefix_rows():
 
 
 def step_rows():
-    d = load("kernel-time")
-    if not d:
-        return None, []
-    return d.get("device_ms_per_step"), [(r["region"], r["ms_per_step"], r["share_pct"])
-                                         for r in d.get("regions", [])]
+    """Per-region cost of a decode step, baseline and optimised side by side."""
+    base = load("kernel-time")
+    opt = load("kernel-time-gqa")
+    if not base:
+        return None, None, []
+    o = {r["region"]: r["ms_per_step"] for r in (opt or {}).get("regions", [])}
+    rows = [(r["region"], r["ms_per_step"], r["share_pct"], o.get(r["region"]))
+            for r in base.get("regions", [])]
+    return base.get("device_ms_per_step"), (opt or {}).get("device_ms_per_step"), rows
 
 
 def bandwidth_rows():
@@ -182,6 +189,15 @@ def markdown():
     L.append("## Serving throughput and latency\n")
     L.append("Qwen2.5-0.5B-Instruct, 32 concurrent requests, prompt mix 128/512/1024 at 50/30/20, "
              "geometric output lengths around 128, median of the recorded runs.\n")
+    L.append("**Do not read this table across instances.** The same code on two rented A40s, "
+             "same GPU model, same Xeon 6342, same vCPU allocation, measured 386 and 771 tok/s, "
+             "with inter-token latency of 80.3 ms and 39.1 ms. A factor of two that the hardware "
+             "label described identically; the cause is unknown and one observation per machine "
+             "is not enough to find it. Rows name their instance, and a ratio is only meaningful "
+             "between rows sharing one. The vLLM row was measured on pod b0flqxf against engine "
+             "rows reading 327 and 386 tok/s there, a gap of 15.4x. The engine rows here come "
+             "from a faster instance, and dividing one by the other would flatter this engine by "
+             "about half.\n")
     L.append("| Config | Backend | Tokens/s | TTFT p50 | TTFT p95 | ITL p50 | ITL p95 | runs |")
     L.append("|---|---|---|---|---|---|---|---|")
     for label, note, tps, t50, t95, i50, i95, n in serving_rows():
@@ -213,7 +229,7 @@ def markdown():
         if ratio:
             L.append(f"\nBlock hit ratio {ratio:.1f}%.")
 
-    step_ms, step = step_rows()
+    step_ms, step_opt_ms, step = step_rows()
     if step:
         L.append("## Where a decode step goes\n")
         L.append(f"CUDA events on the default stream, 32 concurrent requests, "
@@ -221,11 +237,31 @@ def markdown():
                  "bandwidth too and does not run on a rented pod, so this measures which region "
                  "the time is in rather than how close each is to the memory limit. Recording "
                  "events costs something, so read the proportions and not the absolute total.\n")
-        L.append("| Region | ms/step | Share |")
-        L.append("|---|---|---|")
-        for name, ms, pct in step:
-            L.append(f"| `{name}` | {ms:,.3f} | {pct:.1f}% |")
-        L.append("")
+        has_opt = any(o is not None for _, _, _, o in step)
+        if has_opt:
+            L.append("| Region | ms/step | Share | with GQA-shared attention | change |")
+            L.append("|---|---|---|---|---|")
+            for name, ms, pct, o in step:
+                chg = f"{ms / o:.2f}x" if o else "-"
+                L.append(f"| `{name}` | {ms:,.3f} | {pct:.1f}% | {o:,.3f} | {chg} |"
+                         if o else f"| `{name}` | {ms:,.3f} | {pct:.1f}% | - | - |")
+            if step_opt_ms:
+                L.append(f"| **total on device** | **{step_ms:,.3f}** | | "
+                         f"**{step_opt_ms:,.3f}** | **{step_ms / step_opt_ms:.2f}x** |")
+            L.append("")
+            L.append("The second kernel reads each position's K and V once per GQA group "
+                     "instead of once per query head. It was 1.33x *slower* at its first "
+                     "block width: one block per (token, kv head) rather than per (token, "
+                     "query head) also cuts the grid from 448 blocks to 64, and 64 blocks "
+                     "do not fill this card's 84 SMs. Widening the block from 128 to 512 "
+                     "threads recovered the lost parallelism and turned the regression into "
+                     "the figures above.\n")
+        else:
+            L.append("| Region | ms/step | Share |")
+            L.append("|---|---|---|")
+            for name, ms, pct, _ in step:
+                L.append(f"| `{name}` | {ms:,.3f} | {pct:.1f}% |")
+            L.append("")
 
     bw = bandwidth_rows()
     if bw:

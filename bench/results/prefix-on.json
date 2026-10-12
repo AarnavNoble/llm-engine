@@ -28,6 +28,8 @@
     "long_third_e2e_p50_s": 1.5187887570355088,
     "long_third_mean_out_len": 8.0,
     "machine": "NVIDIA A40",
-    "machine_backfilled": "from env.json of the same reproduce.sh run"
+    "machine_backfilled": "from env.json of the same reproduce.sh run",
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured before the instance field existed"
   }
 ]

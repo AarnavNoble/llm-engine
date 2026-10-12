@@ -16,60 +16,72 @@ Full tables, the protocol, and what each figure does and does not mean: **[aarna
 
 Reproduce everything on one machine with `scripts/reproduce.sh` (add `--quick` for a smoke check, which writes to a separate directory and leaves the published numbers alone).
 
-Each row names the machine it was measured on, because they differ. Full
-tables, with the protocol and what each figure does and does not mean, are in
-[docs/results.md](docs/results.md).
+Each row names the instance it was measured on, and that matters more than it
+should. Full tables, with the protocol and what each figure does and does not
+mean, are in [docs/results.md](docs/results.md).
 
 | Result | Number | Measured on |
 |---|---|---|
 | KV slot utilization, paged vs contiguous with a declared cap | **99.0%** vs 54.8% (1.7% reserving full context) | hardware independent |
-| Continuous vs static batching, TTFT p50 | **38x faster** (5,952 ms to 157 ms) | A40, CUDA |
-| Continuous vs static batching, TTFT p95 | **79x faster** (12,896 ms to 163 ms) | A40, CUDA |
-| Continuous vs static batching, throughput | **1.18x** (327 to 386 tok/s) | A40, CUDA |
-| Continuous vs static batching, inter-token p50 | **1.9x worse** (43.2 ms to 80.3 ms) | A40, CUDA |
-| Prefix caching, TTFT p50 on a shared 512-token prompt | **14.4x faster** (1,627 ms to 113 ms), 95.8% block hit ratio | A40, CUDA |
-| Chunked prefill, worst decode stall with a 2,048-token prompt injected | 47.8 ms to **36.8 ms** | A40, CUDA |
+| Continuous vs static batching, TTFT p50 | **53x faster** (3,993 ms to 75 ms) | A40, pod isx98c0 |
+| Continuous vs static batching, TTFT p95 | **92x faster** (7,628 ms to 83 ms) | A40, pod isx98c0 |
+| Continuous vs static batching, throughput | **1.37x** (564 to 771 tok/s) | A40, pod isx98c0 |
+| Continuous vs static batching, inter-token p50 | **1.69x worse** (23.1 ms to 39.1 ms) | A40, pod isx98c0 |
+| Sharing K/V reads across a GQA group, attention kernel | **1.62x faster** (31.56 ms to 19.43 ms per step) | A40, pod isx98c0 |
+| Sharing K/V reads across a GQA group, end to end | **1.27x** (771 to 980 tok/s) | A40, pod isx98c0 |
+| Prefix caching, TTFT p50 on a shared 512-token prompt | **14.4x faster** (1,627 ms to 113 ms), 95.8% block hit ratio | A40, pod b0flqxf |
+| Chunked prefill, worst decode stall with a 2,048-token prompt injected | 47.8 ms to **36.8 ms** | A40, pod b0flqxf |
 | Continuous vs static batching, throughput | **1.47x** | 10-core Mac, CPU |
 | Continuous vs static batching, TTFT p50 | **5.9x faster** (13,673 ms to 2,330 ms) | 10-core Mac, CPU |
 | Admission watermark, preemption recompute waste | **17.1% to 4.7%** of all token work at 8,192 KV slots, 64 preemptions to 11 | hardware independent |
-| vLLM on the same model and GPU | **5,927 tok/s** against this engine's 386 | A40, CUDA |
+| vLLM on the same model and GPU | **5,927 tok/s** against this engine's 386 on that instance | A40, pod b0flqxf |
 
-Three of these are worth reading twice, because they are not the result the
-design predicted.
+**The same code on two rented A40s differed by a factor of two.** Same GPU
+model, same Xeon 6342, same vCPU allocation: 386 tok/s against 771, and
+inter-token latency of 80.3 ms against 39.1 ms. The hardware label described
+both correctly. The cause is unknown and one observation per machine is not
+enough to find it, so every row names its instance and a ratio is only
+meaningful between rows that share one. The vLLM gap of 15.4x is real on pod
+b0flqxf, where both sides were measured; dividing it against the engine
+numbers above would flatter this engine by about half.
 
-**Continuous batching barely moves throughput here, and transforms latency.**
-At 32 concurrent requests with a 0.5B model the A40 is already saturated, so
-there is no idle capacity for better scheduling to reclaim; what it buys is
-admitting a request on the next step rather than after the batch drains. The
-same code on the CPU backend, which is not saturated, shows 1.47x. Same engine,
-different bottleneck.
+That is also why the figures worth quoting from this project are ratios rather
+than absolutes. 1.62x on a kernel and 53x on time-to-first-token survive the
+instance changing. 980 tok/s does not.
 
-**It makes inter-token latency 1.9x worse,** because every resident sequence
-advances on every step. That is the trade, and it is in the table rather than
-omitted from it.
+Four results contradict what the design predicted, and they are in the table
+rather than omitted from it.
 
-**Chunked prefill is nearly pointless on this hardware.** It is worth 1.3x
-here, against a far larger margin on the CPU backend, for the same reason: a
+**Continuous batching barely moves throughput and transforms latency.** 1.37x
+against 53x. At 32 concurrent requests with a 0.5B model the card is already
+saturated, so there is no idle capacity for better scheduling to reclaim; what
+it buys is admitting a request on the next step rather than after the batch
+drains. The CPU backend, which is not saturated, shows 1.47x on throughput.
+Same engine, different bottleneck.
+
+**It makes inter-token latency 1.69x worse,** because every resident sequence
+advances on every step. That is the trade.
+
+**The attention optimisation was 1.33x slower before it was 1.62x faster.**
+Profiling put 87.6% of a decode step in attention, and the obvious reading was
+the sevenfold redundant K/V read that grouped-query attention causes. Removing
+it needs one block per (token, kv head) instead of per (token, query head),
+which also cuts the grid from 448 blocks to 64 on a card with 84 SMs. The
+kernel was parallelism-starved, not bandwidth-starved. Widening the block from
+128 to 512 threads fixed it. "87.6% of time" says where the time goes, not what
+limits it.
+
+**Chunked prefill is nearly pointless on this hardware,** worth 1.3x. A
 2,048-token prefill takes about 37 ms on an A40, so there is barely a stall
 left to subtract. It would matter again with a larger model or longer prompts.
 
-**vLLM is 15x faster, and that row is in the table on purpose.** A comparison
-nobody runs is worth less than one that is unflattering, and the shape of the
-gap says where the work is: inter-token latency is 23x apart while
-time-to-first-token is only 5x, which points at the per-step cost rather than
-at scheduling or paging. The largest known contributor is that every step
-copies 32 x 151,936 fp16 logits to the host and widens them with a branchy
-software conversion before sampling, on the engine thread, while the GPU
-waits. vLLM also uses CUDA graphs, tensor-core attention and fused kernels,
-none of which are implemented here.
-
-Per-kernel bandwidth against the card's peak is still unmeasured: Nsight
-Compute needs `NVreg_RestrictProfilingToAdminUsers=0`, a host kernel-module
-parameter that a rented container cannot set, so `ncu` returns
-`ERR_NVGPUCTRPERM`. The optimisation rows are unmeasured because the
-optimisations are unwritten. Both are rendered as *not measured* on the
-results page rather than estimated, and `bench/report.py` fails rather than
-publishing a figure with no data behind it.
+Per-kernel achieved bandwidth is still unmeasured: Nsight Compute needs
+`NVreg_RestrictProfilingToAdminUsers=0`, a host kernel-module parameter a
+rented container cannot set, and returns `ERR_NVGPUCTRPERM` without it. The
+remaining optimisation rows are unmeasured because the optimisations are
+unwritten. Both are rendered as *not measured* on the results page rather than
+estimated, and `bench/report.py` fails rather than publishing a figure with no
+data behind it.
 
 ## Architecture
 

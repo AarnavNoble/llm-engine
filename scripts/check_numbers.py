@@ -100,6 +100,19 @@ CLAIMS = [
      lambda: kv("contiguous (reserve prompt + max_tokens)", "kv_waste_fraction") * 100, "{:.1f}%"),
     ("allocator workload requests", ["docs/benchmarks.md"],
      lambda: json.loads((RESULTS / "kv-waste.json").read_text())["workload"]["requests"], "{:d}"),
+    # The GPU serving figures were never registered, so when a second instance
+    # produced numbers twice as fast, the README kept quoting the first one's
+    # and this script reported success. Registered now.
+    ("gpu continuous tokens/s", ["README.md"],
+     lambda: last("gpu-continuous", "tokens_per_s"), "{:,.0f}"),
+    ("gpu static tokens/s", ["README.md"],
+     lambda: last("gpu-static", "tokens_per_s"), "{:,.0f}"),
+    ("gpu kernels tokens/s", ["README.md"],
+     lambda: last("gpu-kernels", "tokens_per_s"), "{:,.0f}"),
+    ("gpu continuous TTFT p50 ms", ["README.md"],
+     lambda: last("gpu-continuous", "ttft_p50_ms"), "{:,.0f}"),
+    ("gpu static TTFT p50 ms", ["README.md"],
+     lambda: last("gpu-static", "ttft_p50_ms"), "{:,.0f}"),
     ("continuous tokens/s", ["docs/benchmarks.md", "docs/writeup.md"],
      lambda: last("cpu-continuous", "tokens_per_s"), "{:.1f}"),
     ("static tokens/s", ["docs/benchmarks.md", "docs/writeup.md"],

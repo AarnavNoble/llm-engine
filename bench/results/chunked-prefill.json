@@ -10,7 +10,9 @@
     "itl_max_after_ms": NaN,
     "long_prompt_ttft_s": 1.3619319219142199,
     "machine": "NVIDIA A40",
-    "machine_backfilled": "from env.json of the same reproduce.sh run"
+    "machine_backfilled": "from env.json of the same reproduce.sh run",
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured before the instance field existed"
   },
   {
     "chunk": 512,
@@ -23,7 +25,9 @@
     "itl_max_after_ms": NaN,
     "long_prompt_ttft_s": 1.3797249499475583,
     "machine": "NVIDIA A40",
-    "machine_backfilled": "from env.json of the same reproduce.sh run"
+    "machine_backfilled": "from env.json of the same reproduce.sh run",
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured before the instance field existed"
   },
   {
     "chunk": 128,
@@ -36,6 +40,8 @@
     "itl_max_after_ms": NaN,
     "long_prompt_ttft_s": 1.4565442060120404,
     "machine": "NVIDIA A40",
-    "machine_backfilled": "from env.json of the same reproduce.sh run"
+    "machine_backfilled": "from env.json of the same reproduce.sh run",
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured before the instance field existed"
   }
 ]

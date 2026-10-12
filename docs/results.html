@@ -31,22 +31,23 @@ footer { margin-top:3rem; color:var(--muted); font-size:.85rem; }
 <p class="sub">An LLM inference server written from scratch in C++ and CUDA.
 Paged KV cache, continuous batching, prefix caching, OpenAI-compatible streaming API.
 <a href="https://github.com/AarnavNoble/llm-engine">Source on GitHub</a>.</p>
-<p><em>Generated 2026-10-10 from <code>bench/results/</code>.</em></p>
+<p><em>Generated 2026-10-11 from <code>bench/results/</code>.</em></p>
 <p><em>Last full run on NVIDIA A40 49140 MiB, Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz, CUDA 12.8, driver 580.178.04, commit <code>9643a72</code>. Each row below names the machine it was measured on; rows may come from different machines.</em></p>
 <h2>Serving throughput and latency</h2>
 <p>Qwen2.5-0.5B-Instruct, 32 concurrent requests, prompt mix 128/512/1024 at 50/30/20, geometric output lengths around 128, median of the recorded runs.</p>
+<p><strong>Do not read this table across instances.</strong> The same code on two rented A40s, same GPU model, same Xeon 6342, same vCPU allocation, measured 386 and 771 tok/s, with inter-token latency of 80.3 ms and 39.1 ms. A factor of two that the hardware label described identically; the cause is unknown and one observation per machine is not enough to find it. Rows name their instance, and a ratio is only meaningful between rows sharing one. The vLLM row was measured on pod b0flqxf against engine rows reading 327 and 386 tok/s there, a gap of 15.4x. The engine rows here come from a faster instance, and dividing one by the other would flatter this engine by about half.</p>
 <div class="scroll"><table>
 <thead><tr><th>Config</th><th>Backend</th><th>Tokens/s</th><th>TTFT p50</th><th>TTFT p95</th><th>ITL p50</th><th>ITL p95</th><th>runs</th></tr></thead><tbody>
 <tr class="pending"><td>HF transformers, batch 1</td><td>reference floor</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
 <tr class="pending"><td>HF transformers, padded batch 32</td><td>naive batching</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
 <tr><td>engine, static batching</td><td>CPU backend · hardware not recorded</td><td>38.9</td><td>13,673 ms</td><td>14,696 ms</td><td>94.9 ms</td><td>117.1 ms</td><td>1</td></tr>
 <tr><td>engine, continuous batching</td><td>CPU backend · hardware not recorded</td><td>57.1</td><td>2,330 ms</td><td>2,522 ms</td><td>106.7 ms</td><td>122.5 ms</td><td>1</td></tr>
-<tr><td>engine, static batching</td><td>CUDA backend · NVIDIA A40 (backfilled)</td><td>327.1</td><td>5,952 ms</td><td>12,896 ms</td><td>43.2 ms</td><td>75.3 ms</td><td>3</td></tr>
-<tr><td>engine, continuous batching</td><td>CUDA backend · NVIDIA A40 (backfilled)</td><td>385.8</td><td>157 ms</td><td>163 ms</td><td>80.3 ms</td><td>84.0 ms</td><td>3</td></tr>
+<tr><td>engine, static batching</td><td>CUDA backend · NVIDIA A40 / pod isx98c0</td><td>564.4</td><td>3,993 ms</td><td>7,628 ms</td><td>23.1 ms</td><td>37.4 ms</td><td>3</td></tr>
+<tr><td>engine, continuous batching</td><td>CUDA backend · NVIDIA A40 / pod isx98c0</td><td>770.9</td><td>75 ms</td><td>83 ms</td><td>39.1 ms</td><td>42.0 ms</td><td>3</td></tr>
 <tr class="pending"><td>engine, + prefix caching</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
-<tr class="pending"><td>engine, + fused kernels</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
+<tr><td>engine, + fused kernels</td><td>CUDA backend · NVIDIA A40 / pod isx98c0</td><td>979.8</td><td>57 ms</td><td>62 ms</td><td>29.4 ms</td><td>31.4 ms</td><td>3</td></tr>
 <tr class="pending"><td>engine, + CUDA graphs</td><td>CUDA backend</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td><td>-</td></tr>
-<tr><td>vLLM, same model and GPU</td><td>reference · NVIDIA A40</td><td>5,927.5</td><td>31 ms</td><td>173 ms</td><td>3.5 ms</td><td>8.7 ms</td><td>3</td></tr>
+<tr><td>vLLM, same model and GPU</td><td>reference · NVIDIA A40 / pod b0flqxf</td><td>5,927.5</td><td>31 ms</td><td>173 ms</td><td>3.5 ms</td><td>8.7 ms</td><td>3</td></tr>
 </tbody></table></div>
 <h2>KV cache efficiency</h2>
 <p>Allocator property, measured with a fake model, so it is hardware independent. 256 requests, 65,536 KV token slots (4096 blocks of 16), outputs around 128 tokens.</p>
@@ -69,18 +70,20 @@ Paged KV cache, continuous batching, prefix caching, OpenAI-compatible streaming
 </tbody></table></div>
 <p>Block hit ratio 95.8%.</p>
 <h2>Where a decode step goes</h2>
-<p>CUDA events on the default stream, 32 concurrent requests, 36.05 ms of device time per step. Nsight Compute would give achieved bandwidth too and does not run on a rented pod, so this measures which region the time is in rather than how close each is to the memory limit. Recording events costs something, so read the proportions and not the absolute total.</p>
+<p>CUDA events on the default stream, 32 concurrent requests, 36.09 ms of device time per step. Nsight Compute would give achieved bandwidth too and does not run on a rented pod, so this measures which region the time is in rather than how close each is to the memory limit. Recording events costs something, so read the proportions and not the absolute total.</p>
 <div class="scroll"><table>
-<thead><tr><th>Region</th><th>ms/step</th><th>Share</th></tr></thead><tbody>
-<tr><td><code>embedding</code></td><td>0.012</td><td>0.0%</td></tr>
-<tr><td><code>rmsnorm</code></td><td>0.305</td><td>0.8%</td></tr>
-<tr><td><code>qkv_proj</code></td><td>1.027</td><td>2.8%</td></tr>
-<tr><td><code>rope+store_kv</code></td><td>0.225</td><td>0.6%</td></tr>
-<tr><td><code>attention</code></td><td>31.566</td><td>87.6%</td></tr>
-<tr><td><code>o_proj+residual</code></td><td>0.320</td><td>0.9%</td></tr>
-<tr><td><code>mlp</code></td><td>2.074</td><td>5.8%</td></tr>
-<tr><td><code>head</code></td><td>0.522</td><td>1.4%</td></tr>
+<thead><tr><th>Region</th><th>ms/step</th><th>Share</th><th>with GQA-shared attention</th><th>change</th></tr></thead><tbody>
+<tr><td><code>embedding</code></td><td>0.013</td><td>0.0%</td><td>0.012</td><td>1.06x</td></tr>
+<tr><td><code>rmsnorm</code></td><td>0.307</td><td>0.8%</td><td>0.308</td><td>1.00x</td></tr>
+<tr><td><code>qkv_proj</code></td><td>1.074</td><td>3.0%</td><td>1.017</td><td>1.06x</td></tr>
+<tr><td><code>rope+store_kv</code></td><td>0.226</td><td>0.6%</td><td>0.228</td><td>0.99x</td></tr>
+<tr><td><code>attention</code></td><td>31.564</td><td>87.5%</td><td>19.432</td><td>1.62x</td></tr>
+<tr><td><code>o_proj+residual</code></td><td>0.320</td><td>0.9%</td><td>0.331</td><td>0.97x</td></tr>
+<tr><td><code>mlp</code></td><td>2.060</td><td>5.7%</td><td>2.121</td><td>0.97x</td></tr>
+<tr><td><code>head</code></td><td>0.524</td><td>1.5%</td><td>0.522</td><td>1.00x</td></tr>
+<tr><td><strong>total on device</strong></td><td><strong>36.087</strong></td><td></td><td><strong>23.970</strong></td><td><strong>1.51x</strong></td></tr>
 </tbody></table></div>
+<p>The second kernel reads each position's K and V once per GQA group instead of once per query head. It was 1.33x *slower* at its first block width: one block per (token, kv head) rather than per (token, query head) also cuts the grid from 448 blocks to 64, and 64 blocks do not fill this card's 84 SMs. Widening the block from 128 to 512 threads recovered the lost parallelism and turned the regression into the figures above.</p>
 <h2>Chunked prefill</h2>
 <p>Four streams decoding while a 2,048-token prompt is injected mid-flight. The worst gap is what a user watching tokens appear actually feels; p95 over a few hundred samples hides a single long stall.</p>
 <div class="scroll"><table>

@@ -44,7 +44,9 @@
       "CUDA graphs",
       "scheduler internals",
       "chunked prefill policy"
-    ]
+    ],
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured alongside the superseded 386 tok/s engine rows"
   },
   {
     "machine": "NVIDIA A40",
@@ -91,7 +93,9 @@
       "CUDA graphs",
       "scheduler internals",
       "chunked prefill policy"
-    ]
+    ],
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured alongside the superseded 386 tok/s engine rows"
   },
   {
     "machine": "NVIDIA A40",
@@ -138,6 +142,8 @@
       "CUDA graphs",
       "scheduler internals",
       "chunked prefill policy"
-    ]
+    ],
+    "instance": "pod b0flqxf",
+    "instance_backfilled": "measured alongside the superseded 386 tok/s engine rows"
   }
 ]
