@@ -39,7 +39,10 @@ mean, are in [docs/results.md](docs/results.md).
 **The same code on two rented A40s differed by a factor of two.** Same GPU
 model, same Xeon 6342, same vCPU allocation: 386 tok/s against 771, and
 inter-token latency of 80.3 ms against 39.1 ms. The hardware label described
-both correctly. The cause is unknown and one observation per machine is not
+both correctly. The same continuous-versus-static comparison came out at 38x
+on time-to-first-token on pod b0flqxf and 53x on pod isx98c0, which is why
+both figures appear in this repository's history and only the second is in the
+table above. The cause is unknown and one observation per machine is not
 enough to find it, so every row names its instance and a ratio is only
 meaningful between rows that share one. The vLLM gap of 15.4x is real on pod
 b0flqxf, where both sides were measured; dividing it against the engine
