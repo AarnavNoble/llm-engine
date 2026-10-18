@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/host_profile.h"
 #include "engine/cuda_kernels.h"
 #include "engine/model.h"
 #include "engine/ops.h"
@@ -414,10 +415,17 @@ class CudaModel final : public Model {
     CUDA_CHECK(cudaDeviceSynchronize());
     prof_.flush();
 
+    // Host side from here, and invisible to the CUDA-event profiler above:
+    // these two lines are CPU work, and an event records a position in a
+    // stream rather than time spent on a core. Timed separately because they
+    // are the two halves of the same suspicion and only one of them can be
+    // fixed by a kernel -- the copy is bus-bound, the widening is not.
     const size_t count = static_cast<size_t>(R) * cfg_.vocab_size;
     stage_.resize(count);
-    CUDA_CHECK(cudaMemcpy(stage_.data(), dlog, count * sizeof(__half), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < count; i++) logits[i] = f16_to_f32(stage_[i]);
+    { ENGINE_HOST_SCOPE("logits_readback");
+      CUDA_CHECK(cudaMemcpy(stage_.data(), dlog, count * sizeof(__half), cudaMemcpyDeviceToHost)); }
+    { ENGINE_HOST_SCOPE("logits_widen");
+      for (size_t i = 0; i < count; i++) logits[i] = f16_to_f32(stage_[i]); }
   }
 
  private:

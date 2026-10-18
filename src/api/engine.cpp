@@ -1,5 +1,7 @@
 #include "engine/engine.h"
 
+#include "engine/host_profile.h"
+
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -298,14 +300,20 @@ void Engine::run_loop() {
     auto t0 = Clock::now();
     StepInput step = scheduler_.schedule();
     if (step.empty()) { refresh_gauges(); if (!scheduler_.has_work()) { mark_progress(); continue; } std::this_thread::yield(); continue; }
-    model_->forward(step, logits);
-    auto sampled = sampler_.sample_step(step, logits, vocab);
-    scheduler_.on_step_done(step, sampled);
+    // The denominator for every other profiled region. Opened after the empty
+    // check so an idle poll is not counted as a step with no work in it.
+    { ENGINE_HOST_SCOPE("step_wall");
+      HostProfile::get().count_step();
+      model_->forward(step, logits);
+      { ENGINE_HOST_SCOPE("sampling");
+        auto sampled = sampler_.sample_step(step, logits, vocab);
+        scheduler_.on_step_done(step, sampled);
+        window_tokens += sampled.size(); }
+    }
     auto t1 = Clock::now();
     mark_progress();
     metrics_.step_time.observe(std::chrono::duration<double>(t1 - t0).count());
     metrics_.batch_tokens.observe(step.num_tokens());
-    window_tokens += sampled.size();
     double win = std::chrono::duration<double>(t1 - window_start).count();
     if (win >= 1.0) { metrics_.tokens_per_second = window_tokens / win; window_tokens = 0; window_start = t1; }
     refresh_gauges();
