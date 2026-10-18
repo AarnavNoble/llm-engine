@@ -83,14 +83,15 @@ def make_prompt_ids(n, tok_ids):
     # Deterministic pseudo-prompt: cycle through a bank of token ids; the engine accepts raw ids.
     return [tok_ids[i % len(tok_ids)] for i in range(n)]
 
-async def one(session, url, ids, out_len, ignore_eos, rec, model=None):
+async def one(session, url, ids, out_len, ignore_eos, rec, model=None,
+              temperature=0.0, top_p=1.0):
     # Token ids go in "prompt" as an array, which is the OpenAI spelling and
     # what both servers accept. The older "prompt_token_ids" is a vLLM
     # extension that vLLM 0.31 itself dropped, answering with
     # "Either prompt or prompt_embeds must be provided"; this engine's server
     # takes either. One field for both keeps the generator honest -- the
     # reference row has to be driven by exactly the same client as our own.
-    body = {"prompt": ids, "max_tokens": out_len, "temperature": 0, "stream": True, "ignore_eos": ignore_eos}
+    body = {"prompt": ids, "max_tokens": out_len, "temperature": temperature, "top_p": top_p, "stream": True, "ignore_eos": ignore_eos}
     # This engine ignores "model" -- it serves exactly one. vLLM's
     # OpenAI-compatible API requires it and answers a request without one with
     # a 400 in plain JSON, so no SSE frames ever arrive. Sent only when asked
@@ -140,7 +141,7 @@ async def main(a):
             async with sem:
                 ids = make_prompt_ids(lens[i], tok_bank[i % 50:] + tok_bank[:i % 50])
                 if a.shared_prefix: ids = prefix + ids[: max(1, lens[i] - a.shared_prefix)]
-                await one(s, a.url, ids, outs[i], True, rec, a.model)
+                await one(s, a.url, ids, outs[i], True, rec, a.model, a.temperature, a.top_p)
         tasks = []
         for i in range(a.num_requests):
             if a.rate: await asyncio.sleep(random.expovariate(a.rate))
@@ -166,6 +167,9 @@ async def main(a):
         "instance": instance_label(),
         "tag": a.tag, "concurrency": a.concurrency, "num_requests": a.num_requests, "output_len": a.output_len,
         "output_dist": a.output_dist, "mean_output_len": sum(outs) / len(outs), "max_output_len": max(outs),
+        # On the row, because a top-p row and a greedy row are not comparable
+        # and nothing else in the record would say which this was.
+        "temperature": a.temperature, "top_p": a.top_p,
         "rate": a.rate,
         "shared_prefix": a.shared_prefix, "wall_s": wall,
         "tokens_per_s": rec["tokens"] / wall, "requests_per_s": a.num_requests / wall,
@@ -204,5 +208,12 @@ if __name__ == "__main__":
     ap.add_argument("--prompt-len", type=int, default=0, help="fixed prompt length instead of the 128/512/1024 mix")
     ap.add_argument("--rate", type=float, default=0.0, help="Poisson arrival rate (req/s); 0 = closed loop")
     ap.add_argument("--shared-prefix", type=int, default=0, help="prepend a shared N-token prefix (prefix-cache experiment)")
+    # Sampling defaults to greedy, which is what every row in the results
+    # table was measured with. That is deliberate -- greedy is reproducible and
+    # takes the model out of the measurement -- but it also meant the top-p
+    # path was never benchmarked at all, and a full sort of the vocabulary hid
+    # there for months. Rows that set these say so in their tag.
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     asyncio.run(main(ap.parse_args()))

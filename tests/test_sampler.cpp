@@ -118,3 +118,87 @@ TEST_CASE("sampler: sample_step returns one token per logits-producing slice, in
   auto out = s.sample_step(step, logits, vocab);
   REQUIRE(out == std::vector<int32_t>{1, 3});
 }
+
+// The nucleus is found with nth_element over a widening window rather than a
+// full sort of the vocabulary. That is only safe if it picks the same token as
+// the full sort would for every seed, so this holds a reference full-sort
+// implementation beside it and demands exact agreement.
+//
+// The cases are chosen to cover what the widening loop does: a peaked
+// distribution whose nucleus closes inside the first window of 64, a flat one
+// whose nucleus is most of the vocabulary and forces the loop out to the full
+// sort, and a distribution with deliberate exact ties, which is what the
+// index tie-break in the comparator exists for.
+namespace {
+
+int32_t reference_top_p(const std::vector<float>& logits, const engine::SamplingParams& p) {
+  const int vocab = static_cast<int>(logits.size());
+  std::vector<float> probs(vocab);
+  const float mx = *std::max_element(logits.begin(), logits.end());
+  double sum = 0;
+  for (int i = 0; i < vocab; i++) { probs[i] = std::exp((logits[i] - mx) / p.temperature); sum += probs[i]; }
+  for (int i = 0; i < vocab; i++) probs[i] = static_cast<float>(probs[i] / sum);
+
+  std::vector<int32_t> idx(vocab);
+  std::iota(idx.begin(), idx.end(), 0);
+  std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+    return probs[a] > probs[b] || (probs[a] == probs[b] && a < b);
+  });
+  double cum = 0; int keep = 0;
+  for (; keep < vocab; keep++) { cum += probs[idx[keep]]; if (cum >= p.top_p) { keep++; break; } }
+
+  std::mt19937_64 rng(p.seed);
+  std::uniform_real_distribution<double> u(0.0, cum);
+  double r = u(rng);
+  for (int i = 0; i < keep; i++) { r -= probs[idx[i]]; if (r <= 0) return idx[i]; }
+  return idx[keep - 1];
+}
+
+}  // namespace
+
+TEST_CASE("sampler: the partial-sort nucleus matches a full sort exactly") {
+  const int vocab = 2000;
+  std::mt19937_64 gen(7);
+  std::uniform_real_distribution<float> noise(-1.0f, 1.0f);
+
+  std::vector<std::pair<const char*, std::vector<float>>> cases;
+
+  // Peaked: a handful of tokens hold almost all the mass, so the nucleus
+  // closes inside the first window and the loop never widens.
+  {
+    std::vector<float> l(vocab);
+    for (int i = 0; i < vocab; i++) l[i] = noise(gen) - 12.0f;
+    for (int i = 0; i < 5; i++) l[i * 37] = 9.0f - i;
+    cases.emplace_back("peaked", l);
+  }
+  // Flat: every token is within noise of every other, so top-p 0.95 needs
+  // almost the whole vocabulary and the loop is forced to the full sort.
+  {
+    std::vector<float> l(vocab);
+    for (int i = 0; i < vocab; i++) l[i] = noise(gen) * 0.01f;
+    cases.emplace_back("flat", l);
+  }
+  // Ties: many exactly equal logits, which is what the index tie-break in the
+  // comparator is for. std::sort is unstable, so without it the two paths
+  // could order the nucleus differently and draw different tokens.
+  {
+    std::vector<float> l(vocab, -3.0f);
+    for (int i = 0; i < 400; i++) l[i] = 2.0f;
+    cases.emplace_back("ties", l);
+  }
+
+  engine::Sampler s(1);
+  for (const auto& [name, logits] : cases) {
+    INFO("distribution: " << name);
+    for (float top_p : {0.3f, 0.5f, 0.9f, 0.95f, 0.999f}) {
+      for (uint64_t seed = 1; seed <= 40; seed++) {
+        engine::SamplingParams p;
+        p.temperature = 0.8f;
+        p.top_p = top_p;
+        p.seed = seed;
+        INFO("top_p=" << top_p << " seed=" << seed);
+        REQUIRE(s.sample(logits.data(), vocab, p) == reference_top_p(logits, p));
+      }
+    }
+  }
+}
