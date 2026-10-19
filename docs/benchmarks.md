@@ -115,14 +115,14 @@ requests that share a 512-token system prompt and differ only in a 128-token
 tail, once with the cache enabled and once with `--no-prefix-cache`, on
 otherwise identical servers.
 
-Mac, CPU backend, 8 concurrent, 8 output tokens:
+A40, pod b0flqxf, 32 concurrent, 8 output tokens:
 
 | | cache off | cache on | change |
 |---|---|---|---|
 | TTFT p50 | 1,627 ms | 113 ms | **14.4x faster** |
-| TTFT p95 | 27,874 ms | 8,610 ms | 3.2x faster |
-| end-to-end p50 | 24.4 s | 8.5 s | 2.9x faster |
-| wall clock | 101.7 s | 35.0 s | 2.9x faster |
+| TTFT p95 | 3,698 ms | 1,823 ms | 2.0x faster |
+| end-to-end p50 | 5.42 s | 0.64 s | 8.5x faster |
+| wall clock | 44.0 s | 7.8 s | 5.7x faster |
 
 Hit ratio is 95.8%, 9,808 of 10,240 full prompt blocks, which is exactly the ceiling
 for this workload: 32 of every 40 prompt blocks are shared and the very first
@@ -186,17 +186,17 @@ recomputed tokens over recomputed plus delivered tokens:
 
 | blocks | KV slots | preemptions, no watermark | wasted | preemptions, watermark | wasted |
 |---|---|---|---|---|---|
-| 256 | 4,096 | 162 | 19.2% | 65 | **9.1%** |
-| 384 | 6,144 | 134 | 15.4% | 35 | **5.5%** |
+| 256 | 4,096 | 80 | 18.3% | 26 | **8.5%** |
+| 384 | 6,144 | 66 | 15.9% | 9 | **3.5%** |
 | 512 | 8,192 | 64 | 17.1% | 11 | **4.7%** |
-| 768 | 12,288 | 141 | 16.7% | 14 | **1.9%** |
-| 1,024 | 16,384 | 150 | 17.0% | 2 | **0.1%** |
-| 2,048 | 32,768 | 87 | 10.1% | 0 | **0.0%** |
+| 768 | 12,288 | 61 | 13.3% | 7 | **1.5%** |
+| 1,024 | 16,384 | 49 | 13.3% | 0 | **0.0%** |
+| 2,048 | 32,768 | 23 | 7.6% | 0 | **0.0%** |
 | 4,096 | 65,536 | 0 | 0.0% | 0 | 0.0% |
 
-Without the watermark the curve is not even monotonic: 1,024 blocks wasted more
-than 768 did. That non-monotonicity was the clue. Holding memory at 8,192 slots
-and varying only the sequence cap shows the mechanism:
+Without the watermark the curve is not even monotonic: 512 blocks wasted more
+than 384 did, 17.1% against 15.9%. That non-monotonicity was the clue. Holding
+memory at 8,192 slots and varying only the sequence cap shows the mechanism:
 
 | `max_num_seqs` | decoding, no watermark | preemptions | decoding, watermark | preemptions |
 |---|---|---|---|---|

@@ -152,8 +152,8 @@ prompt plus everything it had generated. The count tells you how often that
 happened; it does not tell you how much work was destroyed.
 
 So I added `engine_recomputed_tokens_total` and swept the pool size. Wasted work
-ran from 19.2% of all token work at the tightest budget down to zero at the
-loosest — but it was not monotonic. 1,024 blocks wasted more than 768 did.
+ran from 18.3% of all token work at the tightest budget down to zero at the
+loosest — but it was not monotonic. 512 blocks wasted more than 384 did.
 
 Non-monotonicity in a quantity that should be monotone is a bug telling you
 where it lives. Holding memory fixed and varying only the sequence cap showed
@@ -181,12 +181,14 @@ that fits is admitted and the engine cannot deadlock.
 
 | KV slots | preemptions | wasted work |
 |---|---|---|
-| 4,096 | 162 → 65 | 19.2% → **9.1%** |
+| 4,096 | 80 → 26 | 18.3% → **8.5%** |
 | 8,192 | 64 → 11 | 17.1% → **4.7%** |
-| 16,384 | 150 → 2 | 17.0% → **0.1%** |
+| 16,384 | 49 → 0 | 13.3% → **0.0%** |
 
-Monotonic now, at a 0.7% occupancy cost. Both columns come from the same run, so
-the comparison stays reproducible instead of becoming a number I remember.
+Monotonic across these three rows — the full seven-row sweep in
+`docs/benchmarks.md` is not, since 384 blocks waste 3.5% against 512's 4.7%.
+Both columns come from the same run, so the comparison stays reproducible
+instead of becoming a number I remember.
 
 **Lesson:** you cannot fix what you are not counting, and a counter without a
 cost attached is only half a metric.
@@ -519,6 +521,19 @@ It also bounds the host cost rather than dismissing it. 36 ms of device time
 against roughly 80 ms of measured inter-token latency leaves about half the
 step outside the kernels, and that half is the host-side work. Both are real.
 Attention is simply the larger single item and the one a kernel can address.
+
+Two corrections, recorded here rather than by rewriting the paragraphs above,
+because what was believed at the time is the point of them. The figures are the
+pre-GQA baseline: the kernel described below landed, and a step is now 23.97 ms
+on device with attention at 81.1%, not 36.05 ms and 87.6%
+(`bench/results/kernel-time-gqa.json`). And "1.4% of device time" above is the
+`head` region, which is the LM-head GEMM — not sampling. There is no sampling
+region, because sampling is host-side and CUDA events record a position in a
+stream rather than time spent on a core, so the device profiler is blind to it
+by construction. The host cost was therefore never measured by the thing used
+to dismiss it; `include/engine/host_profile.h` exists to measure it, and the
+arithmetic that motivated it is 23.97 ms of device time against a 32.66 ms
+step, leaving 8.69 ms — 27% — outside the kernels.
 
 Why it is slow is legible in the kernel rather than mysterious: one block per
 (token, head), 64 threads, scalar fp32 accumulation, no tensor cores, and with

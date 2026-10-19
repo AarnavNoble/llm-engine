@@ -135,7 +135,82 @@ CLAIMS = [
      lambda: sweep(512, "wasted_no_watermark") * 100, "{:.1f}%"),
     ("wasted work with watermark at 8192 slots", ["README.md", "docs/benchmarks.md", "docs/writeup.md"],
      lambda: sweep(512, "wasted_watermark") * 100, "{:.1f}%"),
+    # The rest of the pressure sweep. Registered after six of its seven rows
+    # were found contradicting kv-waste.json: only the 8,192-slot row above
+    # was named here, so only that row had stayed true.
+    ("preemptions without watermark at 256 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=256: sweep(b, "preemptions_no_watermark"), "{:,}"),
+    ("wasted work without watermark at 256 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=256: sweep(b, "wasted_no_watermark") * 100, "{:.1f}%"),
+    ("preemptions with watermark at 256 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=256: sweep(b, "preemptions_watermark"), "{:,}"),
+    ("wasted work with watermark at 256 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=256: sweep(b, "wasted_watermark") * 100, "{:.1f}%"),
+    ("preemptions without watermark at 384 blocks", ["docs/benchmarks.md"],
+     lambda b=384: sweep(b, "preemptions_no_watermark"), "{:,}"),
+    ("wasted work without watermark at 384 blocks", ["docs/benchmarks.md"],
+     lambda b=384: sweep(b, "wasted_no_watermark") * 100, "{:.1f}%"),
+    ("preemptions with watermark at 384 blocks", ["docs/benchmarks.md"],
+     lambda b=384: sweep(b, "preemptions_watermark"), "{:,}"),
+    ("wasted work with watermark at 384 blocks", ["docs/benchmarks.md"],
+     lambda b=384: sweep(b, "wasted_watermark") * 100, "{:.1f}%"),
+    ("preemptions without watermark at 768 blocks", ["docs/benchmarks.md"],
+     lambda b=768: sweep(b, "preemptions_no_watermark"), "{:,}"),
+    ("wasted work without watermark at 768 blocks", ["docs/benchmarks.md"],
+     lambda b=768: sweep(b, "wasted_no_watermark") * 100, "{:.1f}%"),
+    ("preemptions with watermark at 768 blocks", ["docs/benchmarks.md"],
+     lambda b=768: sweep(b, "preemptions_watermark"), "{:,}"),
+    ("wasted work with watermark at 768 blocks", ["docs/benchmarks.md"],
+     lambda b=768: sweep(b, "wasted_watermark") * 100, "{:.1f}%"),
+    ("preemptions without watermark at 1024 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=1024: sweep(b, "preemptions_no_watermark"), "{:,}"),
+    ("wasted work without watermark at 1024 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=1024: sweep(b, "wasted_no_watermark") * 100, "{:.1f}%"),
+    ("preemptions with watermark at 1024 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=1024: sweep(b, "preemptions_watermark"), "{:,}"),
+    ("wasted work with watermark at 1024 blocks", ["docs/benchmarks.md", "docs/writeup.md"],
+     lambda b=1024: sweep(b, "wasted_watermark") * 100, "{:.1f}%"),
+    ("preemptions without watermark at 2048 blocks", ["docs/benchmarks.md"],
+     lambda b=2048: sweep(b, "preemptions_no_watermark"), "{:,}"),
+    ("wasted work without watermark at 2048 blocks", ["docs/benchmarks.md"],
+     lambda b=2048: sweep(b, "wasted_no_watermark") * 100, "{:.1f}%"),
+    ("preemptions with watermark at 2048 blocks", ["docs/benchmarks.md"],
+     lambda b=2048: sweep(b, "preemptions_watermark"), "{:,}"),
+    ("wasted work with watermark at 2048 blocks", ["docs/benchmarks.md"],
+     lambda b=2048: sweep(b, "wasted_watermark") * 100, "{:.1f}%"),
+    # The prefix table's other three rows. Its TTFT p50 was registered and
+    # correct while the rows beside it came from no committed file at all.
+    ("prefix TTFT p95 off", ["docs/benchmarks.md"],
+     lambda: last("prefix-off", "ttft_p95_ms"), "{:,.0f} ms"),
+    ("prefix TTFT p95 on", ["docs/benchmarks.md"],
+     lambda: last("prefix-on", "ttft_p95_ms"), "{:,.0f} ms"),
+    ("prefix e2e p50 off", ["docs/benchmarks.md"],
+     lambda: last("prefix-off", "e2e_p50_s"), "{:.2f} s"),
+    ("prefix e2e p50 on", ["docs/benchmarks.md"],
+     lambda: last("prefix-on", "e2e_p50_s"), "{:.2f} s"),
 ]
+
+
+# Figures that were once true and must not reappear.
+#
+# The claims above check that the right string is *present*. That is not the
+# same as the wrong one being absent, and the difference is not theoretical:
+# "chunked prefill speedup" was registered and passing while README.md:160
+# said 11.8x, because README.md:77 also said 1.3x and presence was all anyone
+# asked for. A document can contradict itself and satisfy every claim in the
+# list. Each entry here is a superseded value, with the figure that replaced
+# it, so the same self-contradiction fails instead of passing.
+STALE = [
+    ("11.8x", "chunked prefill worst-stall speedup, now 1.3x"),
+    ("16.2% to 2.3%", "watermark recompute waste, now 17.1% to 4.7%"),
+    ("0.7% occupancy cost", "never recorded in kv-waste.json; no source"),
+    ("| 162 |", "preemptions at 4,096 slots without the watermark, now 80"),
+    ("19.2%", "wasted work at 4,096 slots without the watermark, now 18.3%"),
+    ("| 150 |", "preemptions at 16,384 slots without the watermark, now 49"),
+    ("27,874", "prefix-off TTFT p95, now 3,698 ms"),
+    ("101.7 s", "prefix-off wall clock, now 44.0 s"),
+]
+STALE_DOCS = ["README.md", "docs/benchmarks.md", "docs/writeup.md"]
 
 
 def main():
@@ -155,13 +230,27 @@ def main():
             if text not in body:
                 mismatches.append((doc, name, text))
 
+    stale = []
+    for doc in STALE_DOCS:
+        body = (ROOT / doc).read_text()
+        for text, why in STALE:
+            if text in body:
+                stale.append((doc, text, why))
+
     print(f"checked {checked} claim/document pairs against {RESULTS.relative_to(ROOT)}")
+    print(f"checked {len(STALE)} superseded figures are absent from "
+          f"{len(STALE_DOCS)} documents")
     for name in missing_data:
         print(f"  no data yet: {name}")
     if mismatches:
         print("\nprose does not match the measurements:")
         for doc, name, text in mismatches:
             print(f"  - {doc} should state {name} as {text}")
+    if stale:
+        print("\nsuperseded figures are still quoted:")
+        for doc, text, why in stale:
+            print(f"  - {doc} still contains {text!r}: {why}")
+    if mismatches or stale:
         print("\nupdate the prose, or re-run the benchmark if the data is stale.")
         sys.exit(1)
     print("every quoted figure matches the data")
